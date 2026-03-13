@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "umimic"
+version = "0.0.2"
+description = "Unified Mechanistic Inference from Multimodal Imaging and Counts"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    {name = "Data Analysis Team @KaziLab.se", email = "umimic@kazilab.se"},
+]
+maintainers = [
+    {name = "Data Analysis Team @KaziLab.se", email = "umimic@kazilab.se"},
+]
+
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.11",
+    "matplotlib>=3.7",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "arviz>=0.17",
+]
+
+[project.optional-dependencies]
+inference = [
+    "pymc>=5.10",
+    "emcee>=3.1",
+]
+dashboard = [
+    "streamlit>=1.30",
+    "plotly>=5.18",
+]
+docs = [
+    "sphinx>=7.2",
+    "myst-parser>=2.0",
+]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "ruff>=0.1",
+    "mypy>=1.7",
+]
+all = ["umimic[inference,dashboard,docs,dev]"]
+
+[project.scripts]
+umimic = "umimic.pipeline.runner:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["umimic*"]
+exclude = ["tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
