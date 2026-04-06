@@ -2,6 +2,17 @@
 
 **Unified Mechanistic Inference from Multimodal Imaging and Counts**
 
+<!-- PyPI version badge -->
+<!--[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://ExposoGraph.streamlit.app)-->
+[![PyPI version](https://img.shields.io/pypi/v/umimic.svg)](https://pypi.org/project/umimic/)
+[![Documentation Status](https://readthedocs.org/projects/umimic/badge/?version=latest)](https://umimic.readthedocs.io/en/latest/?badge=latest)
+<!-- PyPI version badge -->
+[![@KaziLab.se](https://img.shields.io/website?url=https://www.kazilab.se/)](https://www.kazilab.se/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![GitHub](https://img.shields.io/badge/GitHub-kazilab%2Fumimic-181717?logo=github&logoColor=white)](https://github.com/kazilab/umimic)
+<!-- PyPI version badge -->
+
 Developed by: Data Analysis Team @KaziLab.se
 
 U-MIMIC is a Python package for modeling and analyzing tumor population dynamics
