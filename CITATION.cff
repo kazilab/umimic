@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use U-MIMIC, please cite it as follows."
+title: "U-MIMIC"
+version: "0.0.2"
+date-released: 2026-03-20
+license: MIT
+authors:
+  - family-names: "KaziLab Data Analysis Team"
+    given-names: "U-MIMIC Maintainers"
+    email: "umimic@kazilab.se"
+repository-code: "https://github.com/kazilab/umimic"
+url: "https://github.com/kazilab/umimic"
+keywords:
+  - tumor dynamics
+  - pharmacometrics
+  - mechanistic modeling
+  - multimodal inference

@@ -31,6 +31,13 @@ umimic simulate --drug-type cytotoxic --output results/sim
 
 This generates trajectory plots and dose-response curves under `results/sim/`.
 
+Print recommended coupling parameter ranges:
+
+```bash
+umimic config suggest-coupling-ranges
+umimic config suggest-coupling-ranges --format yaml
+```
+
 ## Programmatic Usage
 
 ```python

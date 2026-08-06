@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "umimic"
-version = "0.0.2"
+version = "0.0.4"
 description = "Unified Mechanistic Inference from Multimodal Imaging and Counts"
 readme = "README.md"
 license = "MIT"
@@ -26,13 +26,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# PyMC is intentionally absent: the PyMC backend was withdrawn in 0.0.4
+# because its model ignored the data. Re-add it when the backend returns.
 inference = [
-    "pymc>=5.10",
-    "emcee>=3.1",
-]
-dashboard = [
-    "streamlit>=1.30",
-    "plotly>=5.18",
+    "emcee>=3.1,<4.0",
 ]
 docs = [
     "sphinx>=7.2",
@@ -44,7 +41,7 @@ dev = [
     "ruff>=0.1",
     "mypy>=1.7",
 ]
-all = ["umimic[inference,dashboard,docs,dev]"]
+all = ["umimic[inference,docs,dev]"]
 
 [project.scripts]
 umimic = "umimic.pipeline.runner:main"

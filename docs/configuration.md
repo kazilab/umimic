@@ -18,6 +18,8 @@ All fields have sensible defaults, so you only need to specify what you want to 
 | `priors`     | `PriorConfig`     | see below     | Prior distribution settings          |
 | `data`       | `DataConfig`      | see below     | Data loading settings                |
 | `simulation` | `SimulationConfig`| see below     | Simulation / synthetic data settings |
+| `signaling`  | `SignalingConfig` | see below     | Intracellular signaling dynamics settings |
+| `coupling`   | `CouplingConfig`  | see below     | Signaling-to-fate coupling settings  |
 
 ## `DynamicsConfig`
 
@@ -27,6 +29,9 @@ All fields have sensible defaults, so you only need to specify what you want to 
 | `density_dependent`  | `bool`         | `false`    | Enable logistic density dependence   |
 | `carrying_capacity`  | `float | null` | `null`     | Carrying capacity K (cells)          |
 | `clearance_rate`     | `float`        | `0.1`      | Apoptotic cell clearance rate (1/h)  |
+| `default_birth_base` | `float`        | `0.04`     | Baseline birth rate (1/h) used for default simulation `RateSet` |
+| `default_death_base_p` | `float`      | `0.01`     | Baseline death rate (1/h) for P used in default simulation `RateSet` |
+| `default_death_base_q` | `float`      | `0.005`    | Baseline death rate (1/h) for Q used in default simulation `RateSet` |
 
 ## `PKConfig`
 
@@ -76,6 +81,57 @@ All fields have sensible defaults, so you only need to specify what you want to 
 | `n_particles` | `int`   | `500`      | SMC particle count                      |
 | `n_restarts`  | `int`   | `5`        | MLE multi-start restarts                |
 
+## `SignalingConfig`
+
+| Field          | Type                  | Default          | Description |
+|----------------|-----------------------|------------------|-------------|
+| `enabled`      | `bool`               | `false`          | Enable signaling-aware simulation/inference paths |
+| `model`        | `str`                | `"none"`         | Signaling model identifier (`"none"` or `"toy_mapk_akt"`) |
+| `initial_state`| `dict[str, float]`   | `{}`             | Initial signaling node activities |
+| `parameters`   | `dict[str, float]`   | `{}`             | Signaling model parameters |
+| `observed_nodes` | `list[str]`        | `[]`             | Node names expected in signaling measurements |
+
+## `CouplingConfig`
+
+| Field       | Type                       | Default    | Description |
+|-------------|----------------------------|------------|-------------|
+| `enabled`   | `bool`                     | `false`    | Enable signaling-to-fate coupling |
+| `function`  | `str`                      | `"hill"`   | Coupling family (`"hill"` or `"logistic"`) |
+| `targets`   | `list[str]`                | `[]`       | Targets to modulate: broad (`birth`, `death`, `transition`) or specific (`death:P`, `transition:P->R`) |
+| `parameters`| `dict[str, float]`         | `{}`       | Coupling hyper-parameters |
+| `max_effect_by_target` | `dict[str, float]` | `{}` | Optional per-target effect scales overriding global `parameters.max_effect` |
+| `ec50_by_target` | `dict[str, float]` | `{}` | Optional per-target EC50 overrides for Hill coupling |
+| `hill_by_target` | `dict[str, float]` | `{}` | Optional per-target Hill-coefficient overrides for Hill coupling |
+| `k_by_target` | `dict[str, float]` | `{}` | Optional per-target logistic slope overrides (`parameters.k`) |
+| `center_by_target` | `dict[str, float]` | `{}` | Optional per-target logistic midpoint overrides (`parameters.center`) |
+
+### Coupling Tuning Guidance
+
+For practical initialization, use these approximate ranges before fitting:
+
+- Hill coupling:
+  - `max_effect`: `0.1` to `2.0`
+  - `ec50`: `1e-3` to `10.0`
+  - `hill`: `0.5` to `4.0`
+- Logistic coupling:
+  - `max_effect`: `0.1` to `2.0`
+  - `k`: `0.1` to `10.0`
+  - `center`: `0.0` to `1.0`
+- Per-target overrides:
+  - `max_effect_by_target`: `0.0` to `3.0`
+  - `ec50_by_target`: `1e-3` to `20.0`
+  - `hill_by_target`: `0.5` to `5.0`
+  - `k_by_target`: `0.1` to `20.0`
+  - `center_by_target`: `-1.0` to `2.0`
+
+Programmatic helper:
+
+```python
+from umimic.pipeline.config import CouplingConfig
+
+print(CouplingConfig.recommended_parameter_ranges())
+```
+
 ## `SimulationConfig`
 
 | Field           | Type    | Default       | Description                        |
@@ -110,6 +166,9 @@ seed: 123
 dynamics:
   states: [P, Q]
   density_dependent: false
+  default_birth_base: 0.04
+  default_death_base_p: 0.01
+  default_death_base_q: 0.005
 
 dosing:
   type: constant
@@ -130,4 +189,36 @@ inference:
   mode: mle
   backend: scipy
   n_restarts: 10
+
+signaling:
+  enabled: true
+  model: toy_mapk_akt
+  initial_state:
+    mapk: 0.2
+    akt: 0.1
+  parameters:
+    decay: 0.4
+
+coupling:
+  enabled: true
+  function: hill
+  targets: [birth, death:P, transition:P->R]
+  parameters:
+    max_effect: 0.8
+    ec50: 1.0
+    hill: 2.0
+  max_effect_by_target:
+    birth: 0.4
+    death:P: 1.2
+    transition:P->R: 0.6
+  ec50_by_target:
+    birth: 0.2
+    death:P: 1.5
+  hill_by_target:
+    birth: 2.5
+    transition:P->R: 1.2
+  k_by_target:
+    birth: 3.0
+  center_by_target:
+    birth: 0.25
 ```
