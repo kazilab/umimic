@@ -37,7 +37,6 @@ class TestOneCompartmentPK:
         C = pk.solve(dosing, t_eval)
 
         # Peak after 2nd dose should be higher than after 1st
-        idx_24 = np.argmin(np.abs(t_eval - 24.0))
         idx_48 = np.argmin(np.abs(t_eval - 48.0))
         assert C[idx_48] > C[0]  # accumulation
 

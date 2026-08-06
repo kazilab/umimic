@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from umimic.dynamics.states import CellType, ModelTopology
-from umimic.dynamics.rates import RateSet, EmaxHill
+from umimic.dynamics.rates import RateSet
 from umimic.data.schemas import TimeSeriesData
 
 
@@ -89,3 +89,30 @@ def sample_data_with_drug():
     times = np.array([0, 4, 8, 12, 16, 20, 24, 48, 72], dtype=float)
     counts = np.array([100, 108, 112, 115, 116, 115, 112, 95, 70], dtype=float)
     return TimeSeriesData.from_counts(times, counts, concentration=10.0, group_id="drug")
+
+
+@pytest.fixture
+def invitro_quick_config():
+    """Small in-vitro config tuned for fast integration tests."""
+    from umimic.pipeline.config import ExperimentConfig
+
+    return ExperimentConfig(
+        context="in_vitro",
+        dynamics={"states": ["P", "Q"]},
+        dosing={"concentrations": [0.0, 0.3, 3.0]},
+        observations={"modalities": ["cell_counts"]},
+        simulation={
+            "method": "ode",
+            "initial_cells": 60,
+            "t_max": 24.0,
+            "dt_obs": 6.0,
+            "n_replicates": 2,
+        },
+        inference={"mode": "mle", "backend": "scipy", "n_restarts": 1},
+    )
+
+
+@pytest.fixture
+def extreme_concentrations():
+    """Concentration panel including near-zero and very high drug levels."""
+    return [0.0, 1e-9, 1e6]

@@ -1,7 +1,6 @@
 """Tests for the deterministic ODE system."""
 
 import numpy as np
-import pytest
 
 from umimic.dynamics.ode_system import CellDynamicsODE, build_ode_system
 from umimic.dynamics.states import CellType, ModelTopology

@@ -1,11 +1,8 @@
 """Tests for the linear noise approximation (moment ODEs)."""
 
 import numpy as np
-import pytest
 
 from umimic.dynamics.moment_equations import MomentODE
-from umimic.dynamics.states import CellType, ModelTopology
-from umimic.dynamics.rates import RateSet
 
 
 class TestMomentODE:
@@ -13,7 +10,8 @@ class TestMomentODE:
         """Moment ODE mean should match deterministic ODE."""
         from umimic.dynamics.ode_system import CellDynamicsODE
 
-        exposure_fn = lambda t: 0.0
+        def exposure_fn(t):
+            return 0.0
         mu0 = np.array([200.0, 0.0])
 
         # Moment ODE

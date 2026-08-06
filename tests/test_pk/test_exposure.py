@@ -1,7 +1,6 @@
 """Tests for the unified exposure profile."""
 
 import numpy as np
-import pytest
 
 from umimic.pk.exposure import ExposureProfile
 from umimic.pk.dosing import DosingSchedule

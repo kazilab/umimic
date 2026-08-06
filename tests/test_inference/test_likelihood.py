@@ -4,8 +4,6 @@ import numpy as np
 import pytest
 
 from umimic.inference.likelihood import ModelLikelihood
-from umimic.dynamics.states import ModelTopology
-from umimic.data.schemas import TimeSeriesData
 
 
 class TestModelLikelihood:
@@ -19,6 +17,23 @@ class TestModelLikelihood:
         theta = np.array([0.04, 0.01, 0.05, 1.0, 1.5, 0.005, 0.003, 10.0])
         result = ll(theta)
         assert np.isfinite(result)
+
+    def test_rejects_parameters_the_model_cannot_read(
+        self, two_state_topology, sample_data
+    ):
+        """Unknown names must fail at construction, not return the prior.
+
+        Matches ParticleMCMC: a typo that never reaches build_rate_set would
+        otherwise be optimised or sampled while the wired rates absorb the
+        misfit.
+        """
+        with pytest.raises(ValueError, match="not read by the forward model"):
+            ModelLikelihood(
+                topology=two_state_topology,
+                data=sample_data,
+                param_names=["b0", "d0_P", "khghg_rate"],
+                mode="ode",
+            )
 
     def test_negative_params_return_neg_inf(self, two_state_topology, sample_data):
         """Negative parameters should give -inf log-likelihood."""
@@ -80,7 +95,5 @@ class TestModelLikelihood:
             data=[sample_data, sample_data_with_drug],
             mode="ode",
         )
-        theta = np.array([0.04, 0.01, 0.05, 1.0, 1.5, 0.005, 0.003, 10.0])
-
         # Multi should include contribution from both datasets
         assert ll_multi.n_params == ll_single.n_params

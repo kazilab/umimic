@@ -1,10 +1,9 @@
 """Tests for the Gillespie stochastic simulator."""
 
 import numpy as np
-import pytest
 
 from umimic.dynamics.gillespie import GillespieSimulator, build_reactions
-from umimic.dynamics.states import CellType, ModelTopology
+from umimic.dynamics.states import CellType
 from umimic.dynamics.rates import RateSet
 
 

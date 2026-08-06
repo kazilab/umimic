@@ -3,11 +3,10 @@
 import numpy as np
 import pytest
 
+from umimic.data.schemas import TimeSeriesData
 from umimic.inference.mle import MLEstimator, _minimize_options
 from umimic.inference.likelihood import ModelLikelihood
 from umimic.inference.priors import PriorSpec
-from umimic.dynamics.states import ModelTopology
-from umimic.data.schemas import TimeSeriesData
 
 
 class TestMLEstimator:
@@ -51,6 +50,45 @@ class TestMLEstimator:
         result = estimator.fit(n_restarts=1)
 
         assert "b0" in result.parameters
+
+    def test_bic_uses_the_scored_sample_size(self, two_state_topology, sample_data):
+        """BIC must count scored observations, not time points.
+
+        The anchor observation sets the initial condition and is not scored,
+        and every modality contributes its own terms. Counting time points
+        instead is not a constant offset: the error scales with k, so it
+        survives into the BIC *differences* used for model comparison.
+        """
+        ll = ModelLikelihood(
+            topology=two_state_topology,
+            data=sample_data,
+            mode="ode",
+        )
+        n_times = sum(len(d.times) for d in ll.data_list)
+        assert ll.n_observations == n_times - 1, "anchor should be excluded"
+
+        estimator = MLEstimator(ll, method="Nelder-Mead")
+        result = estimator.fit(n_restarts=1)
+
+        theta_hat = ll.params_to_theta(result.parameters)
+        assert result.bic == pytest.approx(ll.bic(theta_hat), rel=1e-9)
+        # AIC carries no sample size at all, so it is unaffected.
+        assert result.aic == pytest.approx(ll.aic(theta_hat), rel=1e-9)
+
+    def test_bic_is_infinite_when_nothing_is_scored(
+        self, two_state_topology
+    ):
+        """A design with only an anchor point scores nothing; BIC is undefined."""
+        data = TimeSeriesData.from_counts(
+            np.array([0.0, 6.0]), np.array([100.0, np.nan]), concentration=0.0
+        )
+        ll = ModelLikelihood(
+            topology=two_state_topology, data=data, mode="ode"
+        )
+        assert ll.n_observations == 0
+
+        result = MLEstimator(ll, method="Nelder-Mead").fit(n_restarts=1)
+        assert np.isinf(result.bic)
 
     def test_solver_options_are_method_specific(self):
         """Nelder-Mead should use fatol; other methods should use ftol."""

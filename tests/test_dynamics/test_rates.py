@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from umimic.dynamics.rates import EmaxHill, FourParameterLogistic, ConstantRate, RateSet
+from umimic.dynamics.rates import EmaxHill, FourParameterLogistic, RateSet
 from umimic.dynamics.states import CellType
 
 
@@ -102,3 +102,66 @@ class TestRateSet:
         for c in np.logspace(-3, 3, 50):
             assert cytotoxic_rates.birth_rate(c) >= 0
             assert cytotoxic_rates.death_rate(CellType.P, c) >= 0
+
+
+class TestDoseResponseValidation:
+    """Malformed dose-response curves must fail loudly, not fit plausibly."""
+
+    @pytest.mark.parametrize(
+        "kwargs, message",
+        [
+            ({"ec50": 0.0}, "ec50 must be positive"),
+            ({"ec50": -1.0}, "ec50 must be positive"),
+            ({"hill": 0.0}, "hill must be positive"),
+            ({"hill": -2.0}, "hill must be positive"),
+            ({"emax": -0.1}, "emax must be non-negative"),
+        ],
+    )
+    def test_emax_hill_rejects_degenerate_parameters(self, kwargs, message):
+        """HillFoldChange already validated these; EmaxHill did not.
+
+        With ec50 = 0 the denominator collapses to c**hill, so the curve is
+        emax at every positive concentration and 0/0 at zero -- a step
+        function that still produces a finite, fittable likelihood.
+        """
+        with pytest.raises(ValueError, match=message):
+            EmaxHill(**kwargs)
+
+    def test_birth_modulation_above_one_is_rejected(self):
+        """b0 * (1 - mb) clamps at zero, so emax > 1 is a flat ridge.
+
+        Every value above 1 gives an identical trajectory, and reading the
+        estimate as a suppressed fraction implies "more than complete
+        cytostasis".
+        """
+        with pytest.raises(ValueError, match="Birth modulation is the"):
+            RateSet(
+                birth_base=0.05,
+                birth_modulation=EmaxHill(emax=2.0, ec50=1.0, hill=1.0),
+                death_base={CellType.P: 0.01},
+            )
+
+    def test_complete_cytostasis_is_still_allowed(self):
+        """emax == 1 is exactly full suppression and must remain legal.
+
+        The Hill curve only approaches 1 asymptotically, so the birth rate
+        tends to zero rather than reaching it at any finite concentration.
+        """
+        rates = RateSet(
+            birth_base=0.05,
+            birth_modulation=EmaxHill(emax=1.0, ec50=1.0, hill=1.0),
+            death_base={CellType.P: 0.01},
+        )
+        assert rates.birth_rate(1e6, cell_type=CellType.P) == pytest.approx(
+            0.0, abs=1e-6
+        )
+        assert rates.birth_rate(0.0, cell_type=CellType.P) == pytest.approx(0.05)
+
+    def test_death_modulation_above_one_is_untouched(self):
+        """Death modulation is an additive rate, not a fraction."""
+        rates = RateSet(
+            birth_base=0.05,
+            death_base={CellType.P: 0.01},
+            death_modulation={CellType.P: EmaxHill(emax=3.0, ec50=1.0, hill=1.0)},
+        )
+        assert rates.death_rate(CellType.P, 1e6) > 1.0

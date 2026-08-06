@@ -63,3 +63,10 @@ class TestCellCountObservation:
         state = np.array([100.0, 20.0, 50.0])
         expected = obs.expected_value(state)
         assert expected == pytest.approx(50.0)
+
+    def test_zero_cells_state_is_numerically_stable(self):
+        """Zero latent counts should still yield finite likelihoods."""
+        obs = CellCountObservation(overdispersion=10.0)
+        state = np.array([0.0, 0.0, 0.0, 0.0])
+        ll = obs.log_likelihood(0.0, state)
+        assert np.isfinite(ll)
