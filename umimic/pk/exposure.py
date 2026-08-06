@@ -31,8 +31,6 @@ class ExposureProfile:
         self._pk_model = pk_model
         self._dosing = dosing
         self._constant = None
-        self._precomputed_times = None
-        self._precomputed_conc = None
 
         if dosing is not None and dosing.is_constant:
             self._constant = dosing.constant_concentration
@@ -88,9 +86,9 @@ class ExposureProfile:
     def is_constant(self) -> bool:
         return self._constant is not None
 
-    def precompute(self, t_eval: np.ndarray) -> None:
-        """Precompute concentration at given time points for efficiency."""
-        self._precomputed_times = t_eval
-        self._precomputed_conc = np.array(
-            [self.concentration(t) for t in t_eval], dtype=float
-        )
+    # `precompute(t_eval)` was removed in 0.0.4. It filled a cache that
+    # `concentration` never read, so it promised a speed-up it did not
+    # deliver, and wiring it up would have meant silently interpolating a PK
+    # curve whose peaks the requested grid may not resolve. Callers wanting a
+    # cheap repeated evaluation should sample `concentration` on their own
+    # grid and interpolate explicitly, where the error is theirs to see.

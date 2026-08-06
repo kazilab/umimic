@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Callable
 
 import numpy as np
@@ -10,6 +11,8 @@ from scipy import optimize
 from umimic.inference.likelihood import ModelLikelihood
 from umimic.inference.priors import PriorSpec
 from umimic.types import MLEResult
+
+logger = logging.getLogger(__name__)
 
 
 def _minimize_options(method: str) -> dict[str, float | int]:
@@ -139,7 +142,8 @@ class MLEstimator:
                 if result.fun < best_obj:
                     best_obj = result.fun
                     best_result = result
-            except Exception:
+            except Exception as e:
+                logger.warning("Optimization restart %s failed: %s", restart, e)
                 continue
 
         if best_result is None:
@@ -171,11 +175,17 @@ class MLEstimator:
         except Exception:
             pass
 
-        # Information criteria
+        # Information criteria. The BIC sample size is the number of points
+        # that actually entered the likelihood, not the number of time points:
+        # every modality contributes its own term, and the anchor observation
+        # consumed by the initial condition is not scored. Counting time points
+        # instead undercounts multimodal designs and overcounts conditioned
+        # ones, and since the error scales with k it does not cancel from the
+        # BIC *differences* used for model comparison.
         k = len(theta_hat)
-        n_obs = sum(len(d.times) for d in self.likelihood.data_list)
+        n_obs = self.likelihood.n_observations
         aic = 2 * k - 2 * ll
-        bic = k * np.log(max(n_obs, 1)) - 2 * ll
+        bic = k * np.log(n_obs) - 2 * ll if n_obs > 0 else np.inf
 
         return MLEResult(
             parameters=params,
@@ -197,7 +207,6 @@ def _numerical_hessian(
     """Compute numerical Hessian via central finite differences."""
     n = len(x)
     H = np.zeros((n, n))
-    f0 = f(x)
 
     for i in range(n):
         for j in range(i, n):

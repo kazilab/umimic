@@ -23,11 +23,26 @@ class LuciferinKinetics:
     The luciferase reaction rate saturates with substrate:
         g(C_luc) = C_luc / (Km + C_luc)
 
+    .. note::
+       **These units are phenomenological, not biochemical.** `dose` is an
+       administered amount (mg/kg) while `km` is an intracellular substrate
+       concentration; the model omits the volume of distribution and the
+       tissue-uptake step that would connect them, so `C_luc` is in arbitrary
+       units and `dose / km` merely sets where on the saturation curve the
+       imaging window falls. The defaults place a standard 150 mg/kg IP dose
+       comfortably above `km`, i.e. near saturation.
+
+       Use this to model the *shape* of the signal-versus-imaging-time curve
+       and the relative penalty for imaging off-peak. Do not read `km` as a
+       measured Michaelis constant, and do not compare `C_luc` against
+       published luciferin concentrations. :meth:`signal_fraction` is
+       normalized to the peak precisely so that only relative timing matters.
+
     Parameters:
-        dose: Luciferin dose (mg/kg or ug/well)
+        dose: Luciferin dose (mg/kg or ug/well), arbitrary units
         ka_luc: Absorption rate constant (1/min)
         ke_luc: Elimination rate constant (1/min)
-        km: Michaelis-Menten constant for luciferase reaction
+        km: Half-saturation constant, in the same arbitrary units as C_luc
     """
 
     dose: float = 150.0  # mg/kg (standard IP dose)
@@ -37,10 +52,21 @@ class LuciferinKinetics:
 
     @property
     def peak_time(self) -> float:
-        """Time of peak luciferin concentration (minutes post-injection)."""
-        if self.ka_luc <= self.ke_luc:
-            return 0.0
-        return np.log(self.ka_luc / self.ke_luc) / (self.ka_luc - self.ke_luc)
+        """Time of peak luciferin concentration (minutes post-injection).
+
+        t_max = ln(ka/ke) / (ka - ke) is valid for both ka > ke and ka < ke:
+        when ka < ke both the numerator and denominator change sign, so the
+        result stays positive. Only ka == ke needs the limiting form
+        t_max = 1/ka.
+        """
+        ka, ke = self.ka_luc, self.ke_luc
+        if ka <= 0 or ke <= 0:
+            raise ValueError(
+                f"Luciferin rate constants must be positive, got ka={ka}, ke={ke}."
+            )
+        if abs(ka - ke) < 1e-10:
+            return float(1.0 / ka)
+        return float(np.log(ka / ke) / (ka - ke))
 
     def substrate_concentration(self, t_post_injection: float) -> float:
         """Luciferin concentration at time t after injection (minutes).
@@ -103,31 +129,63 @@ class TissueAttenuation:
     that increases with tumor depth and size. Failure to model this
     can cause overestimation of cell death in growing tumors.
 
-    Attenuation model: Att = exp(-mu_eff * depth)
-    where mu_eff is the effective attenuation coefficient.
+    Attenuation model: Att = exp(-mu_eff * depth) for a point source at
+    `depth`. For a tumour of finite size the signal is emitted throughout the
+    volume, so the attenuation is averaged over the emitting volume rather
+    than evaluated at its centre -- see :meth:`attenuation_factor`.
+
+    `reference_depth` is the depth of tissue *above* the tumour (skin and
+    overlying tissue), not the depth of its centre.
     """
 
     mu_eff: float = 0.5  # mm^-1, effective attenuation coefficient
-    reference_depth: float = 2.0  # mm, reference tumor depth
+    reference_depth: float = 2.0  # mm, tissue depth above the tumour
 
     def attenuation_factor(
         self, depth: float | None = None, volume: float | None = None
     ) -> float:
         """Compute attenuation factor (0 to 1).
 
+        With a `volume`, the tumour is treated as a sphere of radius r whose
+        top lies at `reference_depth`, and the attenuation is averaged over
+        the sphere:
+
+            <Att> = exp(-mu*(d0 + r)) * 3*(x*cosh(x) - sinh(x)) / x**3,
+            x = mu*r
+
+        Evaluating ``exp(-mu * (d0 + r))`` alone -- the attenuation at the
+        centroid -- systematically overstates signal loss, because exp is
+        convex and the cells nearest the surface dominate the measured signal.
+        That error grows with tumour size, so it can masquerade as progressive
+        cell loss in a tumour that is actually growing.
+
         Args:
-            depth: Tumor depth in mm (if known).
-            volume: Tumor volume in mm^3 (used to estimate depth if depth unknown).
+            depth: Depth of a point source in mm. Takes precedence over volume.
+            volume: Tumor volume in mm^3.
 
         Returns:
             Fraction of photons reaching detector (1.0 = no attenuation).
         """
-        if depth is None:
-            if volume is not None:
-                # Estimate depth from volume (sphere approximation)
-                radius = (3 * volume / (4 * np.pi)) ** (1 / 3)
-                depth = self.reference_depth + radius
-            else:
-                depth = self.reference_depth
+        if depth is not None:
+            return float(np.exp(-self.mu_eff * max(float(depth), 0.0)))
 
-        return float(np.exp(-self.mu_eff * depth))
+        if volume is None or volume <= 0:
+            return float(np.exp(-self.mu_eff * self.reference_depth))
+
+        radius = (3.0 * float(volume) / (4.0 * np.pi)) ** (1.0 / 3.0)
+        x = self.mu_eff * radius
+
+        # Fold the exp(-mu*r) from the centre depth into the shape factor:
+        #   exp(-x)*cosh(x) = (1 + e^-2x)/2,  exp(-x)*sinh(x) = (1 - e^-2x)/2
+        # so the product stays bounded instead of multiplying an overflowing
+        # cosh by an underflowing exponential.
+        if x < 1e-2:
+            # The closed form subtracts two nearly equal O(x) quantities to
+            # produce an O(x^3) result, losing ~9 digits by x ~ 1e-5. Use the
+            # series instead: exp(-x) * (1 + x^2/10 + ...) = 1 - x + 3x^2/5 ...
+            shape_factor = 1.0 - x + 0.6 * x**2 - (4.0 / 15.0) * x**3
+        else:
+            e2 = np.exp(-2.0 * x)
+            shape_factor = 3.0 * (x * (1.0 + e2) / 2.0 - (1.0 - e2) / 2.0) / x**3
+
+        return float(np.exp(-self.mu_eff * self.reference_depth) * shape_factor)

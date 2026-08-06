@@ -40,6 +40,7 @@ class MultimodalObservation:
         observations: dict[str, float | None],
         latent_state: np.ndarray,
         params: dict | None = None,
+        process_variance: float | dict[str, float] | None = None,
     ) -> float:
         """Joint log-likelihood across all available modalities.
 
@@ -48,11 +49,26 @@ class MultimodalObservation:
                          None or missing entries are skipped.
             latent_state: Latent cell population state vector.
             params: Additional parameters.
+            process_variance: LNA process variance for the viable population,
+                either one scalar shared by every modality or a per-modality
+                dict. Dropping it here is what made "variance fusion" a
+                property of the orchestrated likelihood path only: a caller
+                using this composite directly got measurement noise alone, so
+                the mechanistic birth-versus-death signature never reached any
+                modality. Leave it None for a filter whose latent states are
+                exact particle counts, where there is no LNA variance to fold
+                in.
         """
         total = 0.0
         for name, model in self.models.items():
             if name in observations and observations[name] is not None:
-                ll = model.log_likelihood(observations[name], latent_state, params)
+                if isinstance(process_variance, dict):
+                    variance = process_variance.get(name)
+                else:
+                    variance = process_variance
+                ll = model.log_likelihood(
+                    observations[name], latent_state, params, variance
+                )
                 if np.isfinite(ll):
                     total += ll
                 else:

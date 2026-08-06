@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from umimic.types import InferenceResult, MLEResult, MCMCResult
+from umimic.types import InferenceResult
 
 
 class NumpyEncoder(json.JSONEncoder):

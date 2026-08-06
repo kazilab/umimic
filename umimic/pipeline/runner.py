@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from datetime import datetime, UTC
@@ -73,8 +74,15 @@ def _configure_logging(args: argparse.Namespace) -> Path:
 
 def main():
     """Main CLI entry point."""
+    from umimic import __version__
+
     parser = argparse.ArgumentParser(
         description="U-MIMIC: Unified Mechanistic Inference from Multimodal Imaging and Counts",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"umimic {__version__}",
     )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
@@ -103,15 +111,36 @@ def main():
                            help="Output directory")
     _add_logging_args(gen_parser)
 
-    # Dashboard command
-    dash_parser = subparsers.add_parser("dashboard", help="Launch Streamlit dashboard")
-    dash_parser.add_argument("--port", type=int, default=8501)
-    _add_logging_args(dash_parser)
+    # NOTE: the `dashboard` command was removed in this release. No dashboard
+    # application ships with the package, so the command could only ever fail;
+    # advertising it (and a [dashboard] extra) implied a feature that did not
+    # exist. It will return if and when an app is actually included.
+
+    # Config utility command
+    config_parser = subparsers.add_parser("config", help="Configuration utilities")
+    config_subparsers = config_parser.add_subparsers(
+        dest="config_command", help="Config utility commands"
+    )
+    cfg_ranges_parser = config_subparsers.add_parser(
+        "suggest-coupling-ranges",
+        help="Print recommended coupling parameter ranges",
+    )
+    cfg_ranges_parser.add_argument(
+        "--format",
+        dest="output_format",
+        choices=["json", "yaml"],
+        default="json",
+        help="Output format for suggested ranges.",
+    )
+    _add_logging_args(cfg_ranges_parser)
 
     args = parser.parse_args()
 
     if args.command is None:
         parser.print_help()
+        sys.exit(0)
+    if args.command == "config" and getattr(args, "config_command", None) is None:
+        config_parser.print_help()
         sys.exit(0)
 
     log_path = _configure_logging(args)
@@ -126,8 +155,8 @@ def main():
             _run_fit(args)
         elif args.command == "generate":
             _run_generate(args)
-        elif args.command == "dashboard":
-            _run_dashboard(args)
+        elif args.command == "config":
+            _run_config(args)
         LOGGER.info("Completed '%s' command successfully", args.command)
     except FileNotFoundError as exc:
         LOGGER.error("File not found: %s", exc)
@@ -136,11 +165,24 @@ def main():
         LOGGER.error("Invalid input: %s", exc)
         sys.exit(1)
     except ImportError as exc:
-        LOGGER.error(
-            "Missing dependency: %s. Install optional extras with: "
-            "pip install umimic[all]",
-            exc,
-        )
+        # Only third-party packages are optional extras. A missing umimic.*
+        # module is a broken installation, not something an extra can fix, and
+        # must not be reported as one.
+        name = getattr(exc, "name", "") or ""
+        if name.startswith("umimic"):
+            LOGGER.error(
+                "Internal module %s could not be imported. This indicates a "
+                "corrupt or incomplete umimic installation, not a missing "
+                "optional dependency. Reinstall the package. (%s)",
+                name,
+                exc,
+            )
+        else:
+            LOGGER.error(
+                "Missing optional dependency: %s. Install optional extras "
+                "with: pip install umimic[all]",
+                exc,
+            )
         sys.exit(1)
     except KeyboardInterrupt:
         LOGGER.info("Interrupted by user")
@@ -165,12 +207,12 @@ def _run_simulate(args):
 
     exp = Experiment(config)
 
-    if args.drug_type == "cytotoxic":
-        rs = RateSet.cytotoxic_drug()
-    elif args.drug_type == "cytostatic":
-        rs = RateSet.cytostatic_drug()
-    else:
-        rs = RateSet.cytotoxic_drug()
+    builders = {
+        "cytotoxic": RateSet.cytotoxic_drug,
+        "cytostatic": RateSet.cytostatic_drug,
+        "mixed": RateSet.mixed_drug,
+    }
+    rs = builders[args.drug_type]()
 
     concentrations = config.dosing.concentrations or [0, 0.1, 0.3, 1, 3, 10, 30]
     results = exp.simulate(rate_set=rs, method="ode", concentrations=concentrations)
@@ -240,6 +282,8 @@ def _run_generate(args):
         config = ExperimentConfig()
         LOGGER.info("Using default ExperimentConfig")
 
+    from umimic.data.loaders import save_dataset
+
     exp = Experiment(config)
     dataset = exp.generate_synthetic()
 
@@ -247,47 +291,45 @@ def _run_generate(args):
     out_dir.mkdir(parents=True, exist_ok=True)
     LOGGER.info("Using output directory %s", out_dir)
 
+    # Write the dataset in the documented interchange format so that
+    # `umimic fit --data <this file>` reads it back without conversion.
+    data_path = save_dataset(dataset, out_dir / "dataset.csv")
+
+    # Record the configuration and seed alongside the data for reproducibility.
+    from umimic.pipeline.config import save_config
+
+    config_path = out_dir / "config.yaml"
+    save_config(config, config_path)
+
     print(f"Generated {dataset.n_series} synthetic time series")
     print(f"Concentrations: {dataset.concentrations}")
+    print(f"Dataset written to {data_path}")
+    print(f"Configuration written to {config_path}")
     LOGGER.info(
-        "Generated synthetic dataset with %d series at concentrations=%s",
+        "Generated synthetic dataset with %d series at concentrations=%s -> %s",
         dataset.n_series,
         dataset.concentrations,
+        data_path,
     )
 
 
-def _run_dashboard(args):
-    """Launch Streamlit dashboard."""
-    import subprocess
-    import shutil
+def _run_config(args):
+    """Run configuration utility commands."""
+    from umimic.pipeline.config import CouplingConfig
 
-    # Look for dashboard relative to the package, then fall back to CWD
-    candidates = [
-        Path(__file__).resolve().parent.parent / "dashboard" / "app.py",
-        Path(__file__).resolve().parent.parent.parent / "dashboard" / "app.py",
-        Path.cwd() / "dashboard" / "app.py",
-    ]
-    dashboard_path = next((p for p in candidates if p.exists()), None)
+    if args.config_command == "suggest-coupling-ranges":
+        payload = CouplingConfig.recommended_parameter_ranges()
+        if args.output_format == "yaml":
+            import yaml
 
-    if dashboard_path is None:
-        searched = "\n  ".join(str(p) for p in candidates)
-        LOGGER.error(
-            "Dashboard app.py not found. Searched:\n  %s\n"
-            "Create a dashboard/app.py or pass a path via --app-path.",
-            searched,
-        )
-        sys.exit(1)
+            yaml_payload = json.loads(json.dumps(payload))
+            print(yaml.safe_dump(yaml_payload, sort_keys=True))
+        else:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        LOGGER.info("Printed recommended coupling parameter ranges")
+        return
 
-    if shutil.which("streamlit") is None:
-        LOGGER.error(
-            "Streamlit is not installed. Install it with: pip install umimic[dashboard]"
-        )
-        sys.exit(1)
-
-    LOGGER.info("Launching dashboard from %s on port %d", dashboard_path, args.port)
-    subprocess.run(
-        ["streamlit", "run", str(dashboard_path), "--server.port", str(args.port)],
-    )
+    raise ValueError(f"Unknown config command: {args.config_command}")
 
 
 if __name__ == "__main__":

@@ -7,11 +7,10 @@ from typing import TYPE_CHECKING
 import matplotlib.pyplot as plt
 import numpy as np
 
-from umimic.visualization.style import apply_umimic_style, STATE_COLORS, MEAN_STYLE
+from umimic.visualization.style import apply_umimic_style, MEAN_STYLE
 
 if TYPE_CHECKING:
     from umimic.dynamics.rates import RateSet
-    from umimic.types import InferenceResult
 
 
 def plot_rate_dose_response(

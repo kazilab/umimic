@@ -1,8 +1,15 @@
 """MCMC Bayesian inference for U-MIMIC.
 
-Supports multiple backends:
-- emcee (ensemble sampler, always available)
-- PyMC (NUTS HMC, optional)
+Backends:
+- emcee (affine-invariant ensemble sampler) -- the only supported backend.
+
+The PyMC backend was withdrawn in this release: its model attached the data
+via a constant ``pm.Potential``, so it sampled the prior regardless of the
+observations. See :meth:`MCMCSampler.sample` for details.
+
+Sample layout: posterior draws are returned as ``(n_walkers, n_draws)`` arrays.
+emcee walkers are an interacting ensemble, not independent chains; convergence
+diagnostics account for this.
 """
 
 from __future__ import annotations
@@ -10,7 +17,6 @@ from __future__ import annotations
 import multiprocessing
 import os
 import pickle
-from typing import Any
 
 import numpy as np
 
@@ -32,9 +38,9 @@ def _init_worker(sampler: MCMCSampler) -> None:
     _global_sampler_ref = sampler
 
 
-def _log_posterior_worker(theta: np.ndarray) -> float:
+def _log_posterior_worker(theta: np.ndarray) -> tuple[float, float]:
     """Module-level wrapper for parallel walker evaluation."""
-    return _global_sampler_ref._log_posterior(theta)
+    return _global_sampler_ref._log_posterior_blobs(theta)
 
 
 class MCMCSampler:
@@ -45,30 +51,55 @@ class MCMCSampler:
     p(data | theta) * p(theta).
     """
 
+    #: Backends that are implemented and validated in this release.
+    SUPPORTED_BACKENDS = ("emcee",)
+
     def __init__(
         self,
         likelihood: ModelLikelihood,
         priors: PriorSpec,
         backend: str = "emcee",
+        rng: np.random.Generator | int | None = None,
     ):
+        """
+        Args:
+            likelihood: Model likelihood.
+            priors: Prior specification.
+            backend: Sampling backend. Only "emcee" is supported.
+            rng: Generator or seed. Supplying one makes sampling reproducible.
+        """
         self.likelihood = likelihood
         self.priors = priors
         self.backend = backend
+        self.rng = np.random.default_rng(rng)
 
-    def _log_posterior(self, theta: np.ndarray) -> float:
-        """Log-posterior = log-likelihood + log-prior."""
+    def _log_prob(self, theta: np.ndarray) -> tuple[float, float]:
+        """Return (log_posterior, log_likelihood) at theta."""
         params = self.likelihood.theta_to_params(theta)
 
         # Check prior support (log-prior returns -inf if out of bounds)
         lp = self.priors.log_prior(params)
         if not np.isfinite(lp):
-            return -np.inf
+            return -np.inf, -np.inf
 
         ll = self.likelihood(theta)
         if not np.isfinite(ll):
-            return -np.inf
+            return -np.inf, -np.inf
 
-        return ll + lp
+        return ll + lp, ll
+
+    def _log_posterior(self, theta: np.ndarray) -> float:
+        """Log-posterior = log-likelihood + log-prior."""
+        return self._log_prob(theta)[0]
+
+    def _log_posterior_blobs(self, theta: np.ndarray) -> tuple[float, float]:
+        """Log-posterior with the log-likelihood carried as an emcee blob.
+
+        Keeping the likelihood separate from the posterior is required for
+        information criteria and for posterior predictive work; the two must
+        not be conflated in a single trace.
+        """
+        return self._log_prob(theta)
 
     def sample(
         self,
@@ -98,10 +129,21 @@ class MCMCSampler:
             return self._sample_emcee(
                 n_samples, n_chains, n_warmup, initial_guess, n_processes
             )
-        elif self.backend == "pymc":
-            return self._sample_pymc(n_samples, n_chains, n_warmup, initial_guess)
-        else:
-            raise ValueError(f"Unknown backend: {self.backend}")
+        if self.backend == "pymc":
+            raise NotImplementedError(
+                "The PyMC backend is not available in this release. Its model "
+                "attached the data through a constant pm.Potential, so the "
+                "sampler targeted the prior and the observations had no "
+                "effect on the posterior. Rather than ship a backend that "
+                "silently ignores the data, it has been withdrawn pending a "
+                "differentiable PyTensor forward model (or a tested PyTensor "
+                "wrapper around the numerical likelihood). Use "
+                "backend='emcee'."
+            )
+        raise ValueError(
+            f"Unknown backend: {self.backend!r}. Supported backends: "
+            f"{list(self.SUPPORTED_BACKENDS)}."
+        )
 
     def _sample_emcee(
         self,
@@ -124,19 +166,36 @@ class MCMCSampler:
         # emcee needs at least 2*ndim walkers
         n_walkers = max(n_walkers, 2 * ndim + 2)
 
-        # Initialize walkers around initial guess or prior samples
+        # Initialize walkers around initial guess or prior samples.
         if initial_guess is None:
-            # Sample from prior
+            # Sample from the prior, ordered by likelihood.param_names rather
+            # than by the prior dict's insertion order: theta positions are
+            # defined by param_names, and a mismatch silently permutes
+            # parameters.
+            draws = [self.priors.sample(self.rng) for _ in range(n_walkers)]
+            missing = [
+                name for name in self.likelihood.param_names
+                if name not in draws[0]
+            ]
+            if missing:
+                raise ValueError(
+                    f"Priors do not cover parameter(s) {missing}; every entry "
+                    "of likelihood.param_names needs a prior to initialize "
+                    "walkers."
+                )
             p0 = np.array(
-                [
-                    list(self.priors.sample().values())
-                    for _ in range(n_walkers)
-                ]
+                [[d[name] for name in self.likelihood.param_names] for d in draws]
             )
         else:
-            # Small perturbation around initial guess
-            p0 = initial_guess[np.newaxis, :] + 1e-3 * np.random.randn(
-                n_walkers, ndim
+            initial_guess = np.asarray(initial_guess, dtype=float)
+            if initial_guess.shape != (ndim,):
+                raise ValueError(
+                    f"initial_guess must have shape ({ndim},) matching "
+                    f"likelihood.param_names, got {initial_guess.shape}."
+                )
+            # Small perturbation around initial guess, from the seeded stream.
+            p0 = initial_guess[np.newaxis, :] + 1e-3 * self.rng.standard_normal(
+                (n_walkers, ndim)
             )
             p0 = np.abs(p0)  # ensure positive
 
@@ -144,6 +203,16 @@ class MCMCSampler:
         if n_processes is None:
             n_processes = max(1, min(os.cpu_count() or 1, n_walkers))
         use_pool = n_processes > 1
+
+        # emcee draws its own randomness; seed it from our generator so that a
+        # supplied seed fully determines the run.
+        emcee_seed = int(self.rng.integers(0, 2**32 - 1))
+
+        common = dict(
+            nwalkers=n_walkers,
+            ndim=ndim,
+            blobs_dtype=[("log_likelihood", float)],
+        )
 
         if use_pool:
             try:
@@ -153,7 +222,7 @@ class MCMCSampler:
                     initargs=(self,),
                 )
                 sampler = emcee.EnsembleSampler(
-                    n_walkers, ndim, _log_posterior_worker, pool=pool
+                    log_prob_fn=_log_posterior_worker, pool=pool, **common
                 )
             except (TypeError, AttributeError, pickle.PicklingError):
                 # Fallback to serial if the sampler can't be pickled
@@ -162,13 +231,15 @@ class MCMCSampler:
                 use_pool = False
                 n_processes = 1
                 sampler = emcee.EnsembleSampler(
-                    n_walkers, ndim, self._log_posterior
+                    log_prob_fn=self._log_posterior_blobs, **common
                 )
         else:
             pool = None
             sampler = emcee.EnsembleSampler(
-                n_walkers, ndim, self._log_posterior
+                log_prob_fn=self._log_posterior_blobs, **common
             )
+
+        sampler.random_state = np.random.RandomState(emcee_seed).get_state()
 
         try:
             # Burn-in
@@ -182,21 +253,33 @@ class MCMCSampler:
                 pool.close()
                 pool.join()
 
-        # Extract samples: (n_walkers, n_samples, ndim)
-        chain = sampler.get_chain(flat=False)  # (n_samples, n_walkers, ndim)
-        flat_chain = sampler.get_chain(flat=True)  # (n_samples * n_walkers, ndim)
+        # emcee returns (n_draws, n_walkers, ndim). Keep the walker axis:
+        # collapsing it immediately destroys the information needed for R-hat
+        # and ESS, and emcee walkers are *not* independent chains.
+        chain = sampler.get_chain(flat=False)
+        samples = {
+            name: np.ascontiguousarray(chain[:, :, i].T)  # (n_walkers, n_draws)
+            for i, name in enumerate(self.likelihood.param_names)
+        }
 
-        samples = {}
-        for i, name in enumerate(self.likelihood.param_names):
-            samples[name] = flat_chain[:, i]
+        log_post = sampler.get_log_prob(flat=False).T  # (n_walkers, n_draws)
+        blobs = sampler.get_blobs(flat=False)
+        log_lik = (
+            np.ascontiguousarray(blobs["log_likelihood"].T)
+            if blobs is not None
+            else None
+        )
 
-        # Basic diagnostics
         acceptance = float(np.mean(sampler.acceptance_fraction))
         diagnostics = {
             "acceptance_fraction": acceptance,
             "n_walkers": n_walkers,
             "n_processes": n_processes,
             "backend": "emcee",
+            "seed": emcee_seed,
+            # emcee's ensemble walkers are correlated by construction; they are
+            # reported separately from the notion of independent chains.
+            "walkers_are_independent_chains": False,
         }
 
         try:
@@ -207,73 +290,9 @@ class MCMCSampler:
 
         return MCMCResult(
             samples=samples,
-            log_likelihood_trace=sampler.get_log_prob(flat=True),
+            log_likelihood_trace=log_lik,
+            log_posterior_trace=np.ascontiguousarray(log_post),
             n_chains=n_walkers,
             n_samples=n_samples,
             diagnostics=diagnostics,
-        )
-
-    def _sample_pymc(
-        self,
-        n_samples: int,
-        n_chains: int,
-        n_warmup: int,
-        initial_guess: np.ndarray | None,
-    ) -> MCMCResult:
-        """Run PyMC NUTS sampler."""
-        try:
-            import pymc as pm
-            import pytensor.tensor as pt
-        except ImportError:
-            raise ImportError(
-                "PyMC is required for NUTS sampling. Install with: pip install pymc"
-            )
-
-        with pm.Model() as model:
-            # Define parameter priors
-            theta_vars = {}
-            for name in self.likelihood.param_names:
-                if name in self.priors.distributions:
-                    dist = self.priors.distributions[name]
-                    # Map scipy distributions to PyMC
-                    mean = float(dist.mean())
-                    std = float(dist.std())
-                    theta_vars[name] = pm.TruncatedNormal(
-                        name, mu=mean, sigma=std, lower=0
-                    )
-                else:
-                    theta_vars[name] = pm.HalfNormal(name, sigma=1.0)
-
-            # Custom likelihood via pm.Potential
-            def loglike_op(*args):
-                theta = np.array([float(a) for a in args])
-                return self.likelihood(theta)
-
-            theta_list = [theta_vars[n] for n in self.likelihood.param_names]
-            pm.Potential(
-                "custom_likelihood",
-                pm.math.log(1.0),  # placeholder; actual LL handled via callbacks
-            )
-
-            # Use DEMetropolis (gradient-free) for custom likelihoods
-            trace = pm.sample(
-                draws=n_samples,
-                tune=n_warmup,
-                chains=n_chains,
-                cores=1,
-                step=pm.DEMetropolis(),
-                return_inferencedata=False,
-                progressbar=False,
-            )
-
-        samples = {}
-        for name in self.likelihood.param_names:
-            if name in trace.varnames:
-                samples[name] = trace[name]
-
-        return MCMCResult(
-            samples=samples,
-            n_chains=n_chains,
-            n_samples=n_samples,
-            diagnostics={"backend": "pymc"},
         )

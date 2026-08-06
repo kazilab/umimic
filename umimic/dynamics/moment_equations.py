@@ -10,6 +10,7 @@ where A is the Jacobian of the drift and D is the diffusion matrix.
 
 from __future__ import annotations
 
+import logging
 from typing import Callable
 
 import numpy as np
@@ -17,6 +18,8 @@ from scipy.integrate import solve_ivp
 
 from umimic.dynamics.states import CellType, ModelTopology
 from umimic.dynamics.rates import RateSet
+
+logger = logging.getLogger(__name__)
 
 
 class MomentODE:
@@ -36,10 +39,12 @@ class MomentODE:
         rate_set: RateSet,
         topology: ModelTopology,
         exposure_fn: Callable[[float], float],
+        psd_tolerance: float = 1e-6,
     ):
         self.rate_set = rate_set
         self.topology = topology
         self.exposure_fn = exposure_fn
+        self.psd_tolerance = psd_tolerance
         self.n = topology.n_states
         self._idx = {ct: i for i, ct in enumerate(topology.active_states)}
 
@@ -57,9 +62,11 @@ class MomentODE:
         idx = self._idx
         topo = self.topology
 
-        # Division state indices
+        # Division state indices, paired with their cell types so per-state
+        # birth rates (e.g. a resistant clone's) can be resolved at runtime.
+        self._division_states = list(topo.division_states)
         self._division_idx = np.array(
-            [idx[ct] for ct in topo.division_states], dtype=np.intp
+            [idx[ct] for ct in self._division_states], dtype=np.intp
         )
 
         # Death state indices (excluding A)
@@ -125,49 +132,115 @@ class MomentODE:
         self._n_reactions = len(self._diff_outers)
         self._outer_stack = np.array([o[2] for o in self._diff_outers])  # (R, n, n)
 
-    def rate_matrix(self, t: float, mu: np.ndarray) -> np.ndarray:
-        """Construct the Jacobian matrix A(t) of the drift.
+    def drift(self, t: float, mu: np.ndarray) -> np.ndarray:
+        """Nonlinear drift f(t, mu) = d(mu)/dt.
 
-        A[i,j] = d(drift_i)/d(x_j) evaluated at mu.
+        This is the mean-field vector field and matches
+        :meth:`umimic.dynamics.ode_system.CellDynamicsODE.rhs` exactly.
+
+        It must be evaluated directly rather than as ``J @ mu``: with density
+        dependence the drift is quadratic in ``mu``, so ``J @ mu`` differs from
+        ``f(mu)`` (for a one-state logistic it yields ``r*mu*(1 - 2*mu/K)``,
+        whose fixed point is K/2 instead of K).
         """
         n = self.n
-        A = np.zeros((n, n))
+        f = np.zeros(n)
         c = self.exposure_fn(t)
-        total = float(np.sum(np.maximum(mu, 0)))
+        mu_pos = np.maximum(mu, 0.0)
+        total = self.topology.density_total(mu_pos)
         K = self.topology.carrying_capacity if self.topology.density_dependent else None
 
-        # Birth contributions (vectorized over division states)
-        if len(self._division_idx) > 0:
-            b = self.rate_set.birth_rate(c, total, K)
-            for i in self._division_idx:
-                A[i, i] += b
-                if K is not None and K > 0 and self.rate_set.birth_base > 0 and mu[i] > 0:
-                    mod = (1.0 - float(self.rate_set.birth_modulation(c))
-                           if self.rate_set.birth_modulation else 1.0)
-                    density_term = self.rate_set.birth_base * mod * mu[i] / K
-                    A[i, :] -= density_term
+        # Birth. Rates are resolved per dividing state so that a resistant
+        # clone can carry its own division rate and drug sensitivity.
+        for i, ct in zip(self._division_idx, self._division_states):
+            b = self.rate_set.birth_rate(c, total, K, cell_type=ct)
+            f[i] += b * mu_pos[i]
 
-        # Death contributions
+        # Death (dead cells flow into A when that state is tracked)
         for j, ct in enumerate(self._death_states):
             i = self._death_idx[j]
             d = self.rate_set.death_rate(ct, c)
-            A[i, i] -= d
+            f[i] -= d * mu_pos[i]
             if self._has_A:
-                A[self._a_idx, i] += d
+                f[self._a_idx] += d * mu_pos[i]
 
         # Apoptotic clearance
         if self._has_A:
-            A[self._a_idx, self._a_idx] -= self.rate_set.clearance_rate
+            f[self._a_idx] -= self.rate_set.clearance_rate * mu_pos[self._a_idx]
 
-        # Transitions (vectorized index assignments)
+        # Transitions
         for k, (src, tgt) in enumerate(self._trans_pairs):
             rate = self.rate_set.transition_rate(src, tgt, c)
             i_src = self._trans_src_idx[k]
             i_tgt = self._trans_tgt_idx[k]
-            A[i_src, i_src] -= rate
-            A[i_tgt, i_src] += rate
+            flux = rate * mu_pos[i_src]
+            f[i_src] -= flux
+            f[i_tgt] += flux
 
-        return A
+        return f
+
+    def jacobian(self, t: float, mu: np.ndarray) -> np.ndarray:
+        """Jacobian J(t, mu) with J[i, j] = d(f_i)/d(mu_j), evaluated at mu.
+
+        Used only for the covariance equation. All terms are linear in the
+        state except birth under density dependence, where
+        ``f_i = B(C) * (1 - N/K) * mu_i`` with ``N = m . mu`` the crowding
+        total and ``m`` the density mask, giving
+
+            d(f_i)/d(mu_j) = b(C, N) * delta_ij - B(C) * mu_i * m_j / K
+
+        The mask matters: when apoptotic cells do not occupy space, the
+        density gradient is zero in the apoptotic column and a non-zero entry
+        there would misstate the covariance.
+        """
+        n = self.n
+        J = np.zeros((n, n))
+        c = self.exposure_fn(t)
+        mu_pos = np.maximum(mu, 0.0)
+        mask = self.topology.density_mask
+        total = float(mask @ mu_pos)
+        K = self.topology.carrying_capacity if self.topology.density_dependent else None
+
+        # Birth
+        # The density factor is clamped at zero; past carrying capacity the
+        # birth term is identically zero and so is its derivative.
+        density_active = K is not None and K > 0 and total < K
+        for i, ct in zip(self._division_idx, self._division_states):
+            b = self.rate_set.birth_rate(c, total, K, cell_type=ct)
+            B = self.rate_set.modulated_birth_base(c, cell_type=ct)
+            J[i, i] += b
+            if density_active and B > 0 and mu_pos[i] > 0:
+                J[i, :] -= (B * mu_pos[i] / K) * mask
+
+        # Death
+        for j, ct in enumerate(self._death_states):
+            i = self._death_idx[j]
+            d = self.rate_set.death_rate(ct, c)
+            J[i, i] -= d
+            if self._has_A:
+                J[self._a_idx, i] += d
+
+        # Apoptotic clearance
+        if self._has_A:
+            J[self._a_idx, self._a_idx] -= self.rate_set.clearance_rate
+
+        # Transitions
+        for k, (src, tgt) in enumerate(self._trans_pairs):
+            rate = self.rate_set.transition_rate(src, tgt, c)
+            i_src = self._trans_src_idx[k]
+            i_tgt = self._trans_tgt_idx[k]
+            J[i_src, i_src] -= rate
+            J[i_tgt, i_src] += rate
+
+        return J
+
+    def rate_matrix(self, t: float, mu: np.ndarray) -> np.ndarray:
+        """Deprecated alias for :meth:`jacobian`.
+
+        Retained for backwards compatibility. Note that this is the Jacobian,
+        not the mean drift; use :meth:`drift` for d(mu)/dt.
+        """
+        return self.jacobian(t, mu)
 
     def diffusion_matrix(self, t: float, mu: np.ndarray) -> np.ndarray:
         """Construct the diffusion matrix D(t).
@@ -176,9 +249,9 @@ class MomentODE:
         computes D = sum_k propensity_k * outer_k via np.einsum.
         """
         c = self.exposure_fn(t)
-        total = float(np.sum(np.maximum(mu, 0)))
-        K = self.topology.carrying_capacity if self.topology.density_dependent else None
         mu_pos = np.maximum(mu, 0)
+        total = self.topology.density_total(mu_pos)
+        K = self.topology.carrying_capacity if self.topology.density_dependent else None
 
         # Build propensity vector aligned with self._diff_outers / self._outer_stack
         propensities = np.empty(self._n_reactions)
@@ -186,8 +259,8 @@ class MomentODE:
 
         # Birth reactions
         if len(self._division_idx) > 0:
-            b = self.rate_set.birth_rate(c, total, K)
-            for i in self._division_idx:
+            for i, ct in zip(self._division_idx, self._division_states):
+                b = self.rate_set.birth_rate(c, total, K, cell_type=ct)
                 propensities[idx] = b * mu_pos[i]
                 idx += 1
         # Death reactions
@@ -221,13 +294,13 @@ class MomentODE:
         mu = state_flat[:n]
         Sigma = state_flat[n:].reshape(n, n)
 
-        # Mean dynamics (same as deterministic ODE)
-        A = self.rate_matrix(t, mu)
-        dmu = A @ mu
+        # Mean dynamics: the nonlinear drift, evaluated directly.
+        dmu = self.drift(t, mu)
 
-        # Covariance dynamics: dSigma/dt = A*Sigma + Sigma*A^T + D
+        # Covariance dynamics: dSigma/dt = J*Sigma + Sigma*J^T + D
+        J = self.jacobian(t, mu)
         D = self.diffusion_matrix(t, mu)
-        dSigma = A @ Sigma + Sigma @ A.T + D
+        dSigma = J @ Sigma + Sigma @ J.T + D
 
         return np.concatenate([dmu, dSigma.flatten()])
 
@@ -272,10 +345,19 @@ class MomentODE:
         )
 
         if not sol.success:
+            logger.warning(
+                "Moment ODE solve with %s failed, retrying with BDF: %s",
+                method,
+                sol.message,
+            )
             sol = solve_ivp(
                 self.rhs, t_span, y0, t_eval=t_eval,
                 method="BDF", rtol=1e-6, atol=1e-8,
             )
+            if not sol.success:
+                raise RuntimeError(
+                    f"Moment-equation integration failed after BDF retry: {sol.message}"
+                )
 
         times = sol.t
         n_times = len(times)
@@ -284,12 +366,25 @@ class MomentODE:
         # Reshape covariances: vectorized symmetrization + PSD enforcement
         cov_flat = sol.y[n:, :].T  # (n_times, n*n)
         covs = cov_flat.reshape(n_times, n, n).copy()
-        # Symmetrize all at once
+        # Symmetrize all at once (asymmetry here is pure integrator round-off)
         covs = (covs + np.swapaxes(covs, 1, 2)) / 2
-        # Cheap PSD enforcement: clamp negative eigenvalues only where needed
+
+        # PSD enforcement. Small negative eigenvalues are round-off and are
+        # clamped silently; a large one means the LNA has genuinely broken down
+        # (typically near-extinction) and must not be papered over quietly.
         for k in range(n_times):
             min_eig = np.linalg.eigvalsh(covs[k])[0]
             if min_eig < 0:
+                scale = max(float(np.max(np.abs(np.diag(covs[k])))), 1.0)
+                if -min_eig > self.psd_tolerance * scale:
+                    logger.warning(
+                        "Moment covariance at t=%.4g has eigenvalue %.3e "
+                        "(%.1f%% of the covariance scale); the linear noise "
+                        "approximation is unreliable here.",
+                        times[k],
+                        min_eig,
+                        100.0 * (-min_eig) / scale,
+                    )
                 covs[k] += (-min_eig + 1e-8) * np.eye(n)
 
         return times, means, covs

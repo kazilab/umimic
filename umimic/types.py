@@ -84,6 +84,10 @@ class FilterResult:
     filtered_covs: np.ndarray  # (n_times, n_states, n_states)
     marginal_log_likelihood: float = 0.0
     innovations: np.ndarray | None = None
+    #: True when the forward solve or an update failed. The marginal
+    #: log-likelihood is then -inf and the filtered arrays are NaN from the
+    #: point of failure onward.
+    diverged: bool = False
 
 
 @dataclass
@@ -104,11 +108,20 @@ class MLEResult:
 class MCMCResult:
     """Result from MCMC inference."""
 
-    samples: dict[str, np.ndarray]  # param_name -> (n_chains, n_samples)
-    log_likelihood_trace: np.ndarray | None = None
+    samples: dict[str, np.ndarray]  # param_name -> (n_chains, n_draws)
+    log_likelihood_trace: np.ndarray | None = None  # (n_chains, n_draws)
+    log_posterior_trace: np.ndarray | None = None  # (n_chains, n_draws)
     n_chains: int = 1
     n_samples: int = 0
     diagnostics: dict[str, Any] = field(default_factory=dict)
+
+    def flat(self, name: str) -> np.ndarray:
+        """Samples for one parameter, flattened across chains."""
+        return np.asarray(self.samples[name]).reshape(-1)
+
+    def flat_samples(self) -> dict[str, np.ndarray]:
+        """All parameters flattened across chains."""
+        return {k: np.asarray(v).reshape(-1) for k, v in self.samples.items()}
 
     def posterior_mean(self) -> dict[str, float]:
         return {k: float(np.mean(v)) for k, v in self.samples.items()}

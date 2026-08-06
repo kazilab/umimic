@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import matplotlib.pyplot as plt
-import matplotlib as mpl
 
 # Color palette for cell states
 STATE_COLORS = {

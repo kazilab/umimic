@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Callable
+import logging
+from typing import Callable, Sequence
 
 import numpy as np
 from scipy.integrate import solve_ivp
@@ -10,6 +11,8 @@ from scipy.integrate import solve_ivp
 from umimic.dynamics.states import CellType, ModelTopology
 from umimic.dynamics.rates import RateSet
 from umimic.types import SimulationResult
+
+logger = logging.getLogger(__name__)
 
 
 class CellDynamicsODE:
@@ -20,7 +23,7 @@ class CellDynamicsODE:
         dP/dt = b(C)*P - dP(C)*P - sum(uPj)*P + sum(ujP)*j
         dQ/dt = uPQ*P - uQP*Q - dQ(C)*Q
         dA/dt = sum(di*Xi) - clearance*A     (accumulates dead cells)
-        dR/dt = uPR*P - dR(C)*R
+        dR/dt = bR(C)*R + uPR*P + uQR*Q - dR(C)*R - uRQ*R
 
     where C = C(t) is the drug concentration from the exposure profile.
     """
@@ -30,18 +33,31 @@ class CellDynamicsODE:
         rate_set: RateSet,
         topology: ModelTopology,
         exposure_fn: Callable[[float], float],
+        rate_multiplier_fn: Callable[[float, str], float] | None = None,
     ):
         self.rate_set = rate_set
         self.topology = topology
         self.exposure_fn = exposure_fn
+        self.rate_multiplier_fn = rate_multiplier_fn
         self._state_idx = {ct: i for i, ct in enumerate(topology.active_states)}
+
+    def _multiplier(self, t: float, key: str) -> float:
+        """Return optional time-varying multiplier for a named rate."""
+        if self.rate_multiplier_fn is None:
+            return 1.0
+        mult = float(self.rate_multiplier_fn(t, key))
+        if not np.isfinite(mult) or mult < 0:
+            return 1.0
+        return mult
 
     def rhs(self, t: float, y: np.ndarray) -> np.ndarray:
         """Right-hand side of the ODE system."""
         n = len(self.topology.active_states)
         dydt = np.zeros(n)
         c = self.exposure_fn(t)
-        total = float(np.sum(np.maximum(y, 0.0)))
+        # Only space-occupying cells crowd out division; apoptotic corpses do
+        # not, unless the topology says otherwise.
+        total = self.topology.density_total(y)
         K = (
             self.topology.carrying_capacity
             if self.topology.density_dependent
@@ -53,12 +69,14 @@ class CellDynamicsODE:
 
             # Division (only for proliferating states)
             if ct in self.topology.division_states:
-                b = self.rate_set.birth_rate(c, total, K)
+                b = self.rate_set.birth_rate(c, total, K, cell_type=ct)
+                b *= self._multiplier(t, "birth")
                 dydt[i] += b * pop_i
 
             # Death
             if ct in self.topology.death_states:
                 d = self.rate_set.death_rate(ct, c)
+                d *= self._multiplier(t, f"death:{ct.name}")
                 dydt[i] -= d * pop_i
                 # If apoptotic state tracked, add to A
                 if (
@@ -76,6 +94,7 @@ class CellDynamicsODE:
             for src, tgt in self.topology.transitions:
                 if src == ct:
                     rate = self.rate_set.transition_rate(src, tgt, c)
+                    rate *= self._multiplier(t, f"transition:{src.name}->{tgt.name}")
                     j = self._state_idx[tgt]
                     dydt[i] -= rate * pop_i
                     dydt[j] += rate * pop_i
@@ -114,7 +133,7 @@ class CellDynamicsODE:
         )
 
         if not sol.success:
-            # Retry with stiff solver
+            logger.warning("ODE solve with %s failed, retrying with BDF: %s", method, sol.message)
             sol = solve_ivp(
                 self.rhs,
                 t_span,
@@ -126,6 +145,8 @@ class CellDynamicsODE:
                 atol=1e-10,
                 **kwargs,
             )
+            if not sol.success:
+                raise RuntimeError(f"ODE integration failed after BDF retry: {sol.message}")
 
         populations = {}
         for i, ct in enumerate(self.topology.active_states):
@@ -141,7 +162,7 @@ class CellDynamicsODE:
         self,
         y0: np.ndarray,
         t_span: tuple[float, float],
-        concentrations: list[float],
+        concentrations: Sequence[float],
         t_eval: np.ndarray | None = None,
     ) -> dict[float, SimulationResult]:
         """Solve for multiple constant concentrations (in vitro dose-response).
@@ -159,10 +180,15 @@ class CellDynamicsODE:
         for conc in concentrations:
             # Override exposure function with constant concentration
             original_fn = self.exposure_fn
-            self.exposure_fn = lambda t, c=conc: c
+            self.exposure_fn = self._make_constant_exposure_fn(conc)
             results[conc] = self.solve(y0, t_span, t_eval)
             self.exposure_fn = original_fn
         return results
+
+    @staticmethod
+    def _make_constant_exposure_fn(c: float) -> Callable[[float], float]:
+        """Build a constant-concentration exposure function."""
+        return lambda t: c
 
 
 def build_ode_system(
@@ -170,6 +196,7 @@ def build_ode_system(
     topology: ModelTopology,
     exposure_fn: Callable[[float], float] | None = None,
     constant_concentration: float | None = None,
+    rate_multiplier_fn: Callable[[float, str], float] | None = None,
 ) -> CellDynamicsODE:
     """Convenience builder for the ODE system.
 
@@ -177,9 +204,14 @@ def build_ode_system(
     constant_concentration (for in vitro).
     """
     if exposure_fn is None:
-        if constant_concentration is not None:
-            exposure_fn = lambda t: constant_concentration
-        else:
-            exposure_fn = lambda t: 0.0
+        fixed = constant_concentration if constant_concentration is not None else 0.0
 
-    return CellDynamicsODE(rate_set, topology, exposure_fn)
+        def exposure_fn(t, _c=fixed):
+            return _c
+
+    return CellDynamicsODE(
+        rate_set,
+        topology,
+        exposure_fn,
+        rate_multiplier_fn=rate_multiplier_fn,
+    )

@@ -7,13 +7,13 @@ The key U-MIMIC innovation: use mechanistic parameters learned in vitro
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 
 from umimic.inference.priors import PriorSpec
-from umimic.types import InferenceResult, MCMCResult
+from umimic.types import InferenceResult
 
 
 @dataclass

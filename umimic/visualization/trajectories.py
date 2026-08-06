@@ -12,7 +12,6 @@ from umimic.visualization.style import (
     MEAN_STYLE,
     CI_STYLE,
     DATA_STYLE,
-    ENSEMBLE_STYLE,
     apply_umimic_style,
     get_concentration_colors,
 )

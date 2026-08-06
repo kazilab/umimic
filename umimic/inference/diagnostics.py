@@ -1,99 +1,183 @@
-"""Convergence diagnostics and posterior predictive checks."""
+"""Convergence diagnostics and posterior predictive checks.
+
+R-hat and ESS follow Vehtari et al. (2021), "Rank-normalization, folding, and
+localization: An improved R-hat for assessing convergence of MCMC": chains are
+split in half, rank-normalized, and the potential scale reduction factor is
+computed on the normalized ranks. ArviZ is used when available; otherwise an
+equivalent implementation in this module is used.
+
+Diagnostics that cannot be computed return ``None``, never 1.0. Reporting
+R-hat = 1.0 for a single chain would assert convergence on no evidence.
+"""
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
+from scipy import stats
 
 from umimic.types import MCMCResult
 
+logger = logging.getLogger(__name__)
 
-def compute_rhat(chains: np.ndarray) -> float:
-    """Compute Gelman-Rubin R-hat convergence diagnostic.
+try:  # pragma: no cover - exercised only when arviz is installed and healthy
+    import arviz as az
+
+    _HAS_ARVIZ = True
+except Exception:  # noqa: BLE001 - a broken arviz install must not break us
+    az = None
+    _HAS_ARVIZ = False
+
+
+def _as_2d(chains: np.ndarray) -> np.ndarray | None:
+    """Coerce samples to (n_chains, n_draws), or None if not possible."""
+    arr = np.asarray(chains, dtype=float)
+    if arr.ndim == 1:
+        return arr[np.newaxis, :]
+    if arr.ndim == 2:
+        return arr
+    return None
+
+
+def _split_chains(arr: np.ndarray) -> np.ndarray:
+    """Split each chain in half, doubling the chain count.
+
+    Splitting detects within-chain non-stationarity that a plain
+    between-chain comparison misses.
+    """
+    n_chains, n_draws = arr.shape
+    half = n_draws // 2
+    if half < 2:
+        return arr
+    return np.concatenate([arr[:, :half], arr[:, half : 2 * half]], axis=0)
+
+
+def _rank_normalize(arr: np.ndarray) -> np.ndarray:
+    """Rank-normalize pooled draws to make R-hat robust to heavy tails."""
+    flat = arr.reshape(-1)
+    ranks = stats.rankdata(flat)
+    normalized = stats.norm.ppf((ranks - 0.375) / (len(flat) + 0.25))
+    return normalized.reshape(arr.shape)
+
+
+def compute_rhat(chains: np.ndarray) -> float | None:
+    """Split rank-normalized R-hat.
 
     Args:
-        chains: (n_chains, n_samples) array of MCMC samples.
+        chains: (n_chains, n_draws) array of MCMC samples.
 
     Returns:
-        R-hat value. Values close to 1.0 indicate convergence.
+        R-hat, or None when it is undefined (fewer than two chains after
+        splitting, too few draws, or zero within-chain variance).
     """
-    if chains.ndim == 1:
-        return 1.0  # single chain, can't compute
+    arr = _as_2d(chains)
+    if arr is None:
+        return None
 
-    n_chains, n_samples = chains.shape
-    if n_chains < 2:
-        return 1.0
+    if arr.shape[1] < 4:
+        return None
 
-    # Between-chain variance
-    chain_means = np.mean(chains, axis=1)
-    grand_mean = np.mean(chain_means)
-    B = n_samples * np.var(chain_means, ddof=1)
+    split = _split_chains(arr)
+    if split.shape[0] < 2:
+        return None
 
-    # Within-chain variance
-    chain_vars = np.var(chains, axis=1, ddof=1)
-    W = np.mean(chain_vars)
+    if _HAS_ARVIZ:
+        try:
+            value = float(az.rhat(arr))
+            if np.isfinite(value):
+                return value
+        except Exception:  # pragma: no cover - fall through to local impl
+            logger.debug("ArviZ rhat failed; using local implementation.")
 
-    if W == 0:
-        return 1.0
+    normalized = _rank_normalize(split)
+    n_chains, n_draws = normalized.shape
 
-    # Pooled variance estimate
-    var_hat = (1 - 1 / n_samples) * W + B / n_samples
+    chain_means = normalized.mean(axis=1)
+    chain_vars = normalized.var(axis=1, ddof=1)
 
+    W = float(np.mean(chain_vars))
+    B = float(n_draws * np.var(chain_means, ddof=1))
+
+    if not np.isfinite(W) or W <= 0:
+        return None
+
+    var_hat = (n_draws - 1) / n_draws * W + B / n_draws
     return float(np.sqrt(var_hat / W))
 
 
-def effective_sample_size(samples: np.ndarray) -> float:
-    """Estimate effective sample size (ESS) using autocorrelation.
+def effective_sample_size(samples: np.ndarray) -> float | None:
+    """Bulk effective sample size across chains.
 
     Args:
-        samples: 1D array of MCMC samples.
+        samples: (n_chains, n_draws) or (n_draws,) array.
 
     Returns:
-        Estimated ESS.
+        Estimated ESS, or None when it cannot be computed.
     """
-    n = len(samples)
-    if n < 10:
-        return float(n)
+    arr = _as_2d(samples)
+    if arr is None or arr.shape[1] < 4:
+        return None
 
-    # Compute autocorrelation via FFT
-    x = samples - np.mean(samples)
-    fft_x = np.fft.fft(x, n=2 * n)
-    acf = np.real(np.fft.ifft(fft_x * np.conj(fft_x))[:n])
-    acf /= acf[0]
+    if _HAS_ARVIZ:
+        try:
+            value = float(az.ess(arr))
+            if np.isfinite(value) and value > 0:
+                return value
+        except Exception:  # pragma: no cover
+            logger.debug("ArviZ ess failed; using local implementation.")
 
-    # Sum autocorrelation up to first negative pair
+    normalized = _rank_normalize(_split_chains(arr))
+    n_chains, n_draws = normalized.shape
+
+    # Mean autocorrelation across chains, via FFT.
+    acf_sum = np.zeros(n_draws)
+    for c in range(n_chains):
+        x = normalized[c] - normalized[c].mean()
+        f = np.fft.fft(x, n=2 * n_draws)
+        acf = np.real(np.fft.ifft(f * np.conj(f))[:n_draws])
+        if acf[0] <= 0:
+            return None
+        acf_sum += acf / acf[0]
+    rho = acf_sum / n_chains
+
+    # Geyer initial positive sequence: sum paired autocorrelations while positive.
     tau = 1.0
-    for k in range(1, n // 2):
-        if k + 1 < n and acf[k] + acf[k + 1] < 0:
+    for k in range(1, n_draws - 1, 2):
+        pair = rho[k] + rho[k + 1]
+        if pair <= 0:
             break
-        tau += 2 * acf[k]
+        tau += 2.0 * pair
 
-    return float(n / max(tau, 1.0))
+    total = n_chains * n_draws
+    return float(total / max(tau, 1.0))
 
 
 def summarize_mcmc(result: MCMCResult) -> dict:
-    """Compute summary statistics for MCMC result.
+    """Compute summary statistics for an MCMC result.
 
-    Returns dict with mean, std, ESS, R-hat, and credible intervals
-    for each parameter.
+    Returns a dict with mean, std, ESS, R-hat, and credible intervals for each
+    parameter. `rhat` and `ess` are None when undefined.
     """
     summary = {}
     for name, samples in result.samples.items():
-        flat = samples.flatten()
+        arr = _as_2d(samples)
+        flat = np.asarray(samples, dtype=float).reshape(-1)
+
         entry = {
             "mean": float(np.mean(flat)),
             "std": float(np.std(flat)),
             "median": float(np.median(flat)),
             "ci_2.5": float(np.percentile(flat, 2.5)),
             "ci_97.5": float(np.percentile(flat, 97.5)),
-            "ess": effective_sample_size(flat),
+            "ess": effective_sample_size(arr) if arr is not None else None,
+            "rhat": compute_rhat(arr) if arr is not None else None,
         }
-
-        # R-hat if multiple chains
-        if samples.ndim == 2 and samples.shape[0] > 1:
-            entry["rhat"] = compute_rhat(samples)
-        else:
-            entry["rhat"] = None
-
+        if entry["rhat"] is None:
+            entry["rhat_note"] = (
+                "undefined: needs at least 2 chains (or splittable draws) "
+                "with non-zero within-chain variance"
+            )
         summary[name] = entry
 
     return summary
@@ -102,40 +186,143 @@ def summarize_mcmc(result: MCMCResult) -> dict:
 def posterior_predictive_check(
     result: MCMCResult,
     likelihood_fn,
-    data,
+    data=None,
     n_sim: int = 200,
     rng: np.random.Generator | None = None,
 ) -> dict:
-    """Simulate data from the posterior and compare to observed.
+    """Simulate replicate datasets from the posterior and compare to observed.
+
+    For each posterior draw the forward model is solved and synthetic
+    observations are generated from the observation model. Observed and
+    replicated data are then compared through summary statistics and Bayesian
+    p-values. A p-value near 0 or 1 indicates the model cannot reproduce that
+    feature of the data.
 
     Args:
         result: MCMC result with posterior samples.
-        likelihood_fn: ModelLikelihood object.
-        data: Observed TimeSeriesData.
-        n_sim: Number of posterior predictive simulations.
+        likelihood_fn: ModelLikelihood carrying the model and the data.
+        data: Unused; the likelihood's own data is used so that replicates
+            match the fitted series exactly.
+        n_sim: Number of posterior predictive replicates.
         rng: Random number generator.
 
     Returns:
-        Dict with simulated datasets and summary statistics.
+        Dict with replicated datasets, observed/replicated summaries, and
+        Bayesian p-values per modality.
     """
     rng = rng or np.random.default_rng(42)
-    flat_samples = {k: v.flatten() for k, v in result.samples.items()}
-    n_total = len(next(iter(flat_samples.values())))
 
-    simulated = []
-    indices = rng.choice(n_total, size=min(n_sim, n_total), replace=False)
+    flat = result.flat_samples()
+    n_total = len(next(iter(flat.values())))
+    n_draws = min(n_sim, n_total)
+    indices = rng.choice(n_total, size=n_draws, replace=False)
+
+    modalities = likelihood_fn._active_modalities
+    models = likelihood_fn._modality_models
+
+    replicated: dict[str, list[np.ndarray]] = {m: [] for m in modalities}
+    observed: dict[str, np.ndarray] = {}
+    for modality in modalities:
+        # Same mask the likelihood scores: the anchor point is excluded when
+        # it sets the initial condition, since replicating a point the model
+        # was conditioned on reproduces it by construction.
+        obs = np.concatenate(
+            [
+                series.observations[modality][
+                    likelihood_fn.scored_mask(series, modality)
+                ]
+                for series in likelihood_fn.data_list
+                if series.has_modality(modality)
+            ]
+        )
+        observed[modality] = obs
+
+    log_liks = []
 
     for idx in indices:
         theta = np.array(
-            [flat_samples[name][idx] for name in likelihood_fn.param_names]
+            [flat[name][idx] for name in likelihood_fn.param_names]
         )
-        # Here we would simulate from the model with these params
-        # For now, return the log-likelihood at each posterior sample
-        ll = likelihood_fn(theta)
-        simulated.append(ll)
+        params = likelihood_fn.theta_to_params(theta)
+        rate_set = likelihood_fn._build_rate_set(params)
+
+        draw: dict[str, list[float]] = {m: [] for m in modalities}
+        ok = True
+
+        for conc, series in likelihood_fn._conc_groups.items():
+            times = likelihood_fn._group_times[conc]
+            if len(times) < 2:
+                continue
+            # Same initial-condition contract as ModelLikelihood: pass the
+            # rate set so "stable" (and any rate-dependent) fractions match
+            # the fitted model rather than falling back to pure-P.
+            initials = [
+                likelihood_fn._initial_state(d, rate_set) for d in series
+            ]
+            shared = all(np.allclose(x, initials[0]) for x in initials)
+            try:
+                if shared:
+                    solutions = [
+                        likelihood_fn._solve_forward(
+                            rate_set, conc, times, initials[0]
+                        )
+                    ] * len(series)
+                else:
+                    solutions = [
+                        likelihood_fn._solve_forward(
+                            rate_set, conc, times, x0
+                        )
+                        for x0 in initials
+                    ]
+            except (RuntimeError, ValueError):
+                ok = False
+                break
+
+            for s, (t_sol, means, _) in zip(series, solutions):
+                pos = np.searchsorted(t_sol, s.times)
+                pos = np.clip(pos, 0, len(t_sol) - 1)
+                latent = np.maximum(means[pos], 0.0)
+                for modality in modalities:
+                    if not s.has_modality(modality):
+                        continue
+                    mask = likelihood_fn.scored_mask(s, modality)
+                    model = models[modality]
+                    for state in latent[mask]:
+                        draw[modality].append(
+                            float(model.sample(state, rng, params))
+                        )
+
+        if not ok:
+            continue
+
+        for modality in modalities:
+            replicated[modality].append(np.asarray(draw[modality], dtype=float))
+
+        log_liks.append(likelihood_fn(theta))
+
+    summary = {}
+    for modality in modalities:
+        reps = [r for r in replicated[modality] if r.size == observed[modality].size]
+        if not reps:
+            continue
+        rep = np.vstack(reps)
+        obs = observed[modality]
+
+        summary[modality] = {
+            "observed_mean": float(np.mean(obs)),
+            "replicated_mean": float(np.mean(rep)),
+            "observed_std": float(np.std(obs)),
+            "replicated_std": float(np.mean(np.std(rep, axis=1))),
+            # Bayesian p-values: P(T(y_rep) >= T(y_obs)) under the posterior.
+            "p_value_mean": float(
+                np.mean(np.mean(rep, axis=1) >= np.mean(obs))
+            ),
+            "p_value_std": float(np.mean(np.std(rep, axis=1) >= np.std(obs))),
+            "replicates": rep,
+        }
 
     return {
-        "simulated_ll": np.array(simulated),
-        "mean_ll": float(np.mean(simulated)),
-        "std_ll": float(np.std(simulated)),
+        "modalities": summary,
+        "log_likelihood": np.asarray(log_liks, dtype=float),
+        "n_draws": len(log_liks),
     }
