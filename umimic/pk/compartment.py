@@ -21,7 +21,7 @@ from scipy.integrate import solve_ivp
 
 from umimic.pk.dosing import DosingSchedule
 
-VALID_ROUTES = ("iv_bolus", "iv_infusion", "oral")
+from umimic.pk.dosing import VALID_ROUTES
 
 
 def _validate_t_eval(t_eval: np.ndarray) -> np.ndarray:
@@ -181,15 +181,20 @@ class OneCompartmentPK:
     Oral: dA/dt = -ka * A;  dC/dt = ka*A/Vd - ke*C
     IV infusion: dC/dt = rate/Vd - ke*C over the infusion window
 
+    Oral doses enter the absorption compartment as ``F * amount``. IV
+    routes are unaffected by ``f_oral``.
+
     Parameters:
         vd: Volume of distribution (L or L/kg), must be positive
         ke: Elimination rate constant (1/h), must be non-negative
         ka: Absorption rate constant (1/h), for oral dosing
+        f_oral: Oral bioavailability in (0, 1]; default 1 (complete absorption)
     """
 
     vd: float = 10.0  # L
     ke: float = 0.1   # 1/h (half-life ~7h)
     ka: float | None = None  # oral absorption (None = IV)
+    f_oral: float = 1.0
 
     def __post_init__(self) -> None:
         if not np.isfinite(self.vd) or self.vd <= 0:
@@ -198,6 +203,10 @@ class OneCompartmentPK:
             raise ValueError(f"ke must be a non-negative rate constant, got {self.ke}.")
         if self.ka is not None and (not np.isfinite(self.ka) or self.ka <= 0):
             raise ValueError(f"ka must be a positive rate constant, got {self.ka}.")
+        if not np.isfinite(self.f_oral) or not (0.0 < self.f_oral <= 1.0):
+            raise ValueError(
+                f"f_oral must lie in (0, 1], got {self.f_oral}."
+            )
 
     def solve(
         self,
@@ -243,7 +252,7 @@ class OneCompartmentPK:
             return rhs
 
         def apply_oral(y, amount):
-            y[0] += amount
+            y[0] += self.f_oral * amount
 
         def apply_bolus(y, amount):
             y[1] += amount / self.vd
@@ -273,12 +282,16 @@ class TwoCompartmentPK:
     dC1/dt = -(ke + k12)*C1 + k21*C2*(V2/V1) + input(t)/V1
     dC2/dt = k12*C1*(V1/V2) - k21*C2
 
+    Oral doses enter the absorption compartment as ``F * amount``. IV
+    routes are unaffected by ``f_oral``.
+
     Parameters:
         vc: Central compartment volume (L), must be positive
         vp: Peripheral compartment volume (L), must be positive
         cl: Clearance (L/h), must be non-negative
         q: Intercompartmental clearance (L/h), must be non-negative
         ka: Absorption rate for oral dosing (1/h)
+        f_oral: Oral bioavailability in (0, 1]; default 1
     """
 
     vc: float = 10.0   # L
@@ -286,6 +299,7 @@ class TwoCompartmentPK:
     cl: float = 1.0    # L/h
     q: float = 0.5     # L/h
     ka: float | None = None
+    f_oral: float = 1.0
 
     def __post_init__(self) -> None:
         if not np.isfinite(self.vc) or self.vc <= 0:
@@ -298,6 +312,10 @@ class TwoCompartmentPK:
             raise ValueError(f"q must be a non-negative clearance, got {self.q}.")
         if self.ka is not None and (not np.isfinite(self.ka) or self.ka <= 0):
             raise ValueError(f"ka must be a positive rate constant, got {self.ka}.")
+        if not np.isfinite(self.f_oral) or not (0.0 < self.f_oral <= 1.0):
+            raise ValueError(
+                f"f_oral must lie in (0, 1], got {self.f_oral}."
+            )
 
     @property
     def ke(self) -> float:
@@ -343,7 +361,7 @@ class TwoCompartmentPK:
             return rhs
 
         def apply_oral(y, amount):
-            y[0] += amount
+            y[0] += self.f_oral * amount
 
         def apply_bolus(y, amount):
             y[1] += amount / self.vc

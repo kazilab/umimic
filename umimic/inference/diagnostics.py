@@ -25,9 +25,30 @@ try:  # pragma: no cover - exercised only when arviz is installed and healthy
     import arviz as az
 
     _HAS_ARVIZ = True
-except Exception:  # noqa: BLE001 - a broken arviz install must not break us
+except Exception as exc:  # noqa: BLE001 - a broken arviz install must not break us
     az = None
     _HAS_ARVIZ = False
+    _ARVIZ_ERROR = exc
+
+_warned_no_arviz = False
+
+
+def _warn_once_no_arviz() -> None:
+    """Warn the first time a diagnostic falls back off ArviZ.
+
+    Not debug-level: which implementation computed a published R-hat is not an
+    implementation detail, and a silently broken arviz install is easy to miss.
+    Emitted on first use rather than at import so merely importing umimic stays
+    quiet.
+    """
+    global _warned_no_arviz
+    if _HAS_ARVIZ or _warned_no_arviz:
+        return
+    _warned_no_arviz = True
+    logger.warning(
+        "ArviZ unavailable (%s); using umimic's own R-hat/ESS implementation.",
+        _ARVIZ_ERROR,
+    )
 
 
 def _as_2d(chains: np.ndarray) -> np.ndarray | None:
@@ -90,6 +111,7 @@ def compute_rhat(chains: np.ndarray) -> float | None:
         except Exception:  # pragma: no cover - fall through to local impl
             logger.debug("ArviZ rhat failed; using local implementation.")
 
+    _warn_once_no_arviz()
     normalized = _rank_normalize(split)
     n_chains, n_draws = normalized.shape
 
@@ -127,19 +149,37 @@ def effective_sample_size(samples: np.ndarray) -> float | None:
         except Exception:  # pragma: no cover
             logger.debug("ArviZ ess failed; using local implementation.")
 
+    _warn_once_no_arviz()
     normalized = _rank_normalize(_split_chains(arr))
     n_chains, n_draws = normalized.shape
 
-    # Mean autocorrelation across chains, via FFT.
-    acf_sum = np.zeros(n_draws)
+    # Mean autocovariance across chains, via FFT. Note this is the
+    # autocovariance, not each chain's self-normalized autocorrelation:
+    # normalizing per chain by its own acov[0] discards the between-chain
+    # variance entirely, so chains stuck in different modes each look like
+    # clean iid draws and ESS is reported as the full sample size.
+    acov_sum = np.zeros(n_draws)
     for c in range(n_chains):
         x = normalized[c] - normalized[c].mean()
         f = np.fft.fft(x, n=2 * n_draws)
-        acf = np.real(np.fft.ifft(f * np.conj(f))[:n_draws])
-        if acf[0] <= 0:
-            return None
-        acf_sum += acf / acf[0]
-    rho = acf_sum / n_chains
+        acov = np.real(np.fft.ifft(f * np.conj(f))[:n_draws]) / n_draws
+        acov_sum += acov
+    mean_acov = acov_sum / n_chains
+
+    # Combine within- and between-chain variance exactly as split-Rhat does,
+    # then form rho_t = 1 - (W - mean_acov_t) / var_hat (Vehtari et al. 2021).
+    chain_vars = normalized.var(axis=1, ddof=1)
+    W = float(np.mean(chain_vars))
+    if not np.isfinite(W) or W <= 0:
+        return None
+
+    B = float(n_draws * np.var(normalized.mean(axis=1), ddof=1))
+    var_hat = (n_draws - 1) / n_draws * W + B / n_draws
+    if not np.isfinite(var_hat) or var_hat <= 0:
+        return None
+
+    rho = 1.0 - (W - mean_acov) / var_hat
+    rho[0] = 1.0
 
     # Geyer initial positive sequence: sum paired autocorrelations while positive.
     tau = 1.0
@@ -150,7 +190,12 @@ def effective_sample_size(samples: np.ndarray) -> float | None:
         tau += 2.0 * pair
 
     total = n_chains * n_draws
-    return float(total / max(tau, 1.0))
+    if tau <= 0:
+        return None
+    # ESS above the raw sample size is an artifact of antithetic draws; Stan
+    # caps it at N log10(N), and reporting more draws than were taken is
+    # never useful here.
+    return float(min(total / tau, total * np.log10(max(total, 10))))
 
 
 def summarize_mcmc(result: MCMCResult) -> dict:
@@ -278,7 +323,7 @@ def posterior_predictive_check(
                 ok = False
                 break
 
-            for s, (t_sol, means, _) in zip(series, solutions):
+            for s, (t_sol, means, covs) in zip(series, solutions):
                 pos = np.searchsorted(t_sol, s.times)
                 pos = np.clip(pos, 0, len(t_sol) - 1)
                 latent = np.maximum(means[pos], 0.0)
@@ -287,9 +332,34 @@ def posterior_predictive_check(
                         continue
                     mask = likelihood_fn.scored_mask(s, modality)
                     model = models[modality]
-                    for state in latent[mask]:
+                    # Match the likelihood noise model: fold LNA process
+                    # variance into replicates when moment mode supplies it.
+                    process_vars = None
+                    if covs is not None and hasattr(model, "project_variance"):
+                        from umimic.inference.likelihood import (
+                            MODALITY_OBSERVABLE,
+                        )
+
+                        observable = MODALITY_OBSERVABLE.get(modality)
+                        if observable is not None:
+                            process_vars = np.asarray(
+                                model.project_variance(
+                                    observable, covs[pos][mask]
+                                )
+                            )
+                    scored_states = latent[mask]
+                    for i, state in enumerate(scored_states):
+                        pv = (
+                            float(process_vars[i])
+                            if process_vars is not None
+                            else None
+                        )
                         draw[modality].append(
-                            float(model.sample(state, rng, params))
+                            float(
+                                model.sample(
+                                    state, rng, params, process_variance=pv
+                                )
+                            )
                         )
 
         if not ok:

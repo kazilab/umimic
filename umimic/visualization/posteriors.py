@@ -76,13 +76,21 @@ def plot_trace(
     result: MCMCResult,
     params: list[str] | None = None,
     figsize: tuple[float, float] | None = None,
+    max_chains_legend: int = 8,
 ) -> plt.Figure:
     """Plot MCMC trace plots for convergence assessment.
+
+    Samples are expected as ``(n_chains, n_draws)`` (emcee walkers or
+    independent chains). Each chain is drawn as its own trace so mixing and
+    walker-to-walker disagreement remain visible. Flattening walkers into one
+    series would invent a false iteration axis.
 
     Args:
         result: MCMC result.
         params: Which parameters to plot.
         figsize: Figure size.
+        max_chains_legend: Show a chain legend only when the chain count is
+            at most this many (avoids clutter for large ensembles).
     """
     apply_umimic_style()
     params = params or list(result.samples.keys())
@@ -95,21 +103,50 @@ def plot_trace(
     if n == 1:
         axes = axes[np.newaxis, :]
 
+    # Distinct hues for chains (cycle if many).
+    chain_cmap = plt.get_cmap("tab10")
+
     for i, name in enumerate(params):
-        samples = result.samples[name].flatten()
+        arr = np.asarray(result.samples[name], dtype=float)
+        if arr.ndim == 1:
+            arr = arr[np.newaxis, :]
+        if arr.ndim != 2:
+            raise ValueError(
+                f"samples[{name!r}] must be 1-D or 2-D (n_chains, n_draws), "
+                f"got shape {arr.shape}."
+            )
+        n_chains, n_draws = arr.shape
 
-        # Trace plot
-        axes[i, 0].plot(samples, linewidth=0.3, alpha=0.7, color="#333333")
+        for c in range(n_chains):
+            color = chain_cmap(c % 10)
+            label = f"chain {c}" if n_chains <= max_chains_legend else None
+            axes[i, 0].plot(
+                np.arange(n_draws),
+                arr[c],
+                linewidth=0.5,
+                alpha=0.75,
+                color=color,
+                label=label,
+            )
         axes[i, 0].set_ylabel(name, fontsize=9)
-        axes[i, 0].set_xlabel("Iteration")
+        axes[i, 0].set_xlabel("Draw")
+        if n_chains <= max_chains_legend and n_chains > 1 and i == 0:
+            axes[i, 0].legend(fontsize=6, ncol=min(n_chains, 4))
 
-        # Histogram
-        axes[i, 1].hist(samples, bins=50, density=True, alpha=0.7,
-                        color="#2196F3", edgecolor="white", linewidth=0.5)
+        # Pooled marginal (all chains)
+        axes[i, 1].hist(
+            arr.reshape(-1),
+            bins=50,
+            density=True,
+            alpha=0.7,
+            color="#2196F3",
+            edgecolor="white",
+            linewidth=0.5,
+        )
         axes[i, 1].set_xlabel(name)
 
-    axes[0, 0].set_title("Trace")
-    axes[0, 1].set_title("Distribution")
+    axes[0, 0].set_title("Trace (per chain / walker)")
+    axes[0, 1].set_title("Pooled distribution")
     fig.tight_layout()
     return fig
 

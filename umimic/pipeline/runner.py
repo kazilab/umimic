@@ -229,10 +229,11 @@ def _run_simulate(args):
     fig = plot_dose_response_trajectories(results, title=f"Dose-Response ({args.drug_type})")
     fig.savefig(out_dir / "trajectories.png", dpi=150, bbox_inches="tight")
 
-    fig2 = plot_rate_dose_response(rs)
+    fig2 = plot_rate_dose_response(rs, topology=exp.topology)
     fig2.savefig(out_dir / "rate_dose_response.png", dpi=150, bbox_inches="tight")
 
-    fig3 = plot_net_growth_curve(rs)
+    # Asymptotic multi-state growth (not naive b - d_P).
+    fig3 = plot_net_growth_curve(rs, topology=exp.topology)
     fig3.savefig(out_dir / "net_growth.png", dpi=150, bbox_inches="tight")
 
     print(f"Simulation results saved to {out_dir}")
@@ -249,14 +250,25 @@ def _run_fit(args):
     exp = Experiment(config)
     LOGGER.info("Loaded config from %s", args.config)
 
-    # Generate or load data
-    if args.data:
+    # Generate or load data. `--data` wins; otherwise fall back to the path in
+    # the config. Without that fallback a config that named a dataset was
+    # silently replaced by *simulated* data whenever --data was omitted, and
+    # nothing in the output said so.
+    data_path = args.data or config.data.path
+    if data_path:
         from umimic.data.loaders import load_csv
-        dataset = load_csv(args.data, config.data)
-        LOGGER.info("Loaded dataset from %s with %d series", args.data, dataset.n_series)
+        dataset = load_csv(data_path, config.data)
+        source = "--data" if args.data else "config data.path"
+        LOGGER.info(
+            "Loaded dataset from %s (%s) with %d series",
+            data_path, source, dataset.n_series,
+        )
     else:
         dataset = exp.generate_synthetic()
-        LOGGER.info("Generated synthetic dataset with %d series", dataset.n_series)
+        LOGGER.info(
+            "No --data and no data.path in config; generated synthetic dataset "
+            "with %d series", dataset.n_series,
+        )
 
     result = exp.fit(dataset)
 

@@ -9,7 +9,7 @@ from typing import Literal
 
 import numpy as np
 import yaml
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from umimic.inference.likelihood import PARAMETER_SETS
 
@@ -24,7 +24,25 @@ def _is_valid_coupling_target(token: str) -> bool:
     return _COUPLING_TARGET_PATTERN.fullmatch(token) is not None
 
 
-class DynamicsConfig(BaseModel):
+class _ValidatedModel(BaseModel):
+    """Base for every config section, with assignment validation enabled.
+
+    Without ``validate_assignment`` every validator in this file is one
+    attribute assignment away from being bypassed: ``cfg.dynamics.states =
+    ["Z"]`` or ``cfg.inference.backend = "particle"`` were accepted silently,
+    which defeats the point of checks like `_backend_is_dispatched` and
+    `_reject_unimplemented_linear_chain` -- both of which exist precisely to
+    fail before any data is loaded. Loading a config and then tweaking it in a
+    notebook is the documented workflow, so it has to stay validated.
+
+    Note this re-runs field and model validators for the mutated section only.
+    Cross-section checks on ExperimentConfig still require reconstruction.
+    """
+
+    model_config = ConfigDict(validate_assignment=True)
+
+
+class DynamicsConfig(_ValidatedModel):
     """Configuration for cell-state dynamics."""
 
     states: list[str] = ["P", "Q"]
@@ -345,8 +363,13 @@ class DynamicsConfig(BaseModel):
         return v
 
 
-class PKConfig(BaseModel):
-    """Configuration for pharmacokinetic model."""
+class PKConfig(_ValidatedModel):
+    """Configuration for pharmacokinetic model.
+
+    Oral bioavailability ``f_oral`` scales only oral deposits into the
+    absorption compartment (IV routes are unaffected). See
+    ``umimic/pk/SCIENTIFIC_ASSUMPTIONS.md``.
+    """
 
     model: Literal["none", "one_compartment", "two_compartment"] = "none"
     vd: float = 10.0
@@ -356,6 +379,22 @@ class PKConfig(BaseModel):
     vp: float | None = None
     cl: float | None = None
     q: float | None = None
+    #: Oral bioavailability F in (0, 1]; default complete absorption.
+    f_oral: float = 1.0
+    #: Knots per hour used to cache the exposure profile, or 0 to solve the PK
+    #: exactly at every query (the default). Caching makes the stochastic
+    #: simulators dramatically faster -- they evaluate the exposure once per
+    #: event -- at the cost of linear interpolation between knots. Off by
+    #: default because it is an approximation, and one that would otherwise be
+    #: applied to existing configurations without anyone asking for it.
+    cache_resolution: float = 0.0
+
+    @field_validator("cache_resolution")
+    @classmethod
+    def _non_negative_cache_resolution(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("pk.cache_resolution must be >= 0 (0 disables caching)")
+        return v
 
     @field_validator("vd", "ke")
     @classmethod
@@ -371,8 +410,15 @@ class PKConfig(BaseModel):
             raise ValueError("Optional PK parameters must be > 0 when provided")
         return v
 
+    @field_validator("f_oral")
+    @classmethod
+    def _valid_f_oral(cls, v: float) -> float:
+        if not np.isfinite(v) or not (0.0 < v <= 1.0):
+            raise ValueError(f"f_oral must lie in (0, 1], got {v}")
+        return v
 
-class DosingConfig(BaseModel):
+
+class DosingConfig(_ValidatedModel):
     """Configuration for dosing schedule."""
 
     type: Literal["constant", "single_bolus", "repeated_bolus", "oral"] = "constant"
@@ -444,7 +490,7 @@ class DosingConfig(BaseModel):
         return self
 
 
-class ObservationConfig(BaseModel):
+class ObservationConfig(_ValidatedModel):
     """Configuration for observation models."""
 
     modalities: list[str] = ["cell_counts"]
@@ -485,11 +531,17 @@ class ObservationConfig(BaseModel):
         return v
 
 
-class SignalingConfig(BaseModel):
-    """Configuration for intracellular signaling dynamics."""
+class SignalingConfig(_ValidatedModel):
+    """Configuration for intracellular signaling dynamics.
+
+    The toy MAPK/AKT model is a coupling scaffold, not a mechanistic pathway
+    model -- see ``umimic/signaling/SCIENTIFIC_ASSUMPTIONS.md``.
+    """
 
     enabled: bool = False
     model: Literal["none", "toy_mapk_akt"] = "none"
+    #: Drug effect on pathway activity for the toy model (inhibitors by default).
+    direction: Literal["inhibitory", "stimulatory"] = "inhibitory"
     initial_state: dict[str, float] = Field(default_factory=dict)
     parameters: dict[str, float] = Field(default_factory=dict)
     observed_nodes: list[str] = Field(default_factory=list)
@@ -502,8 +554,15 @@ class SignalingConfig(BaseModel):
         return v
 
 
-class CouplingConfig(BaseModel):
-    """Configuration for signaling-to-fate coupling functions."""
+class CouplingConfig(_ValidatedModel):
+    """Configuration for signaling-to-fate coupling functions.
+
+    Rate multipliers are ``max(0, 1 + max_effect * e(activity))`` with
+    ``max_effect >= 0`` and ``e`` in [0, 1]. High pathway activity therefore
+    *boosts* targeted rates above the bare RateSet; low activity returns them
+    toward 1. Baseline rates should be interpreted as the pathway-off floor.
+    See ``umimic/signaling/SCIENTIFIC_ASSUMPTIONS.md``.
+    """
 
     enabled: bool = False
     function: Literal["hill", "logistic"] = "hill"
@@ -655,7 +714,7 @@ class CouplingConfig(BaseModel):
         return v
 
 
-class InferenceConfig(BaseModel):
+class InferenceConfig(_ValidatedModel):
     """Configuration for inference engine."""
 
     # Modes Experiment.fit() actually dispatches. "smc" and "hierarchical"
@@ -686,7 +745,11 @@ class InferenceConfig(BaseModel):
     n_chains: int = 4
     n_warmup: int = 1000
     #: Only read by :class:`umimic.inference.ParticleMCMC`, which the pipeline
-    #: does not dispatch; see the backend validator below.
+    #: does not dispatch (see the backend validator below), so setting this
+    #: through a pipeline config has no effect. Kept as a field so that
+    #: configs written for direct ParticleMCMC use still round-trip, and
+    #: flagged at construction rather than ignored -- see
+    #: `_warn_on_inert_settings`.
     n_particles: int = 500
     n_restarts: int = 5
 
@@ -717,7 +780,7 @@ class InferenceConfig(BaseModel):
         return self
 
 
-class PriorConfig(BaseModel):
+class PriorConfig(_ValidatedModel):
     """Configuration for prior distributions."""
 
     b0: dict[str, float] = {"dist_param_scale": 0.04, "dist_param_s": 0.5}
@@ -727,7 +790,7 @@ class PriorConfig(BaseModel):
     hill_death: dict[str, float] = {"dist_param_scale": 1.5, "dist_param_s": 0.3}
 
 
-class DataConfig(BaseModel):
+class DataConfig(_ValidatedModel):
     """Configuration for data loading."""
 
     format: str = "csv"
@@ -738,7 +801,7 @@ class DataConfig(BaseModel):
     replicate_column: str = "replicate_id"
 
 
-class SimulationConfig(BaseModel):
+class SimulationConfig(_ValidatedModel):
     """Configuration for synthetic data generation."""
 
     method: Literal["ode", "gillespie", "tau_leaping"] = "gillespie"
@@ -746,7 +809,9 @@ class SimulationConfig(BaseModel):
     t_max: float = 72.0
     dt_obs: float = 4.0
     n_replicates: int = 4
-    seed: int = 42
+    #: Overrides the top-level `seed` for simulation when set. None means
+    #: "use ExperimentConfig.seed"; an explicit value wins.
+    seed: int | None = None
 
     @field_validator("initial_cells", "n_replicates")
     @classmethod
@@ -764,13 +829,13 @@ class SimulationConfig(BaseModel):
 
     @field_validator("seed")
     @classmethod
-    def _non_negative_seed(cls, v: int) -> int:
-        if v < 0:
+    def _non_negative_seed(cls, v: int | None) -> int | None:
+        if v is not None and v < 0:
             raise ValueError("seed must be non-negative")
         return v
 
 
-class ExperimentConfig(BaseModel):
+class ExperimentConfig(_ValidatedModel):
     """Top-level experiment configuration."""
 
     name: str = "experiment"
@@ -818,9 +883,29 @@ class ExperimentConfig(BaseModel):
             raise ValueError(
                 "parameter_set='mechanism' needs forward_mode='moment'. The "
                 "mean alone cannot separate reduced division from increased "
-                "death; it is the LNA process variance (scaling with b + d "
-                "while the mean scales with b - d) that breaks the degeneracy."
+                "death, since both reduce net growth; only the LNA process "
+                "variance (scaling with b + d while the mean scales with "
+                "b - d) carries that information. Note that 'moment' is "
+                "necessary but usually not sufficient: the variance route is "
+                "underpowered at realistic counting noise -- see "
+                "umimic/inference/SCIENTIFIC_ASSUMPTIONS.md section 2a."
             )
+
+        # A dosing schedule is only ever read through a PK model. With
+        # pk.model='none' the exposure collapses to the constant
+        # dosing.concentrations[0], so a fully specified bolus regimen is
+        # silently discarded and the run proceeds drug-free.
+        if self.pk.model == "none" and self.dosing.type != "constant":
+            raise ValueError(
+                f"dosing.type={self.dosing.type!r} specifies a schedule "
+                "(dose amounts and times), but pk.model='none' provides no "
+                "model to turn doses into concentrations, so the schedule "
+                "would be ignored and the experiment would run drug-free. "
+                "Set pk.model='one_compartment' or 'two_compartment', or use "
+                "dosing.type='constant' for a fixed-concentration exposure."
+            )
+
+        _warn_on_inert_settings_impl(self)
 
         # NOTE: whether the parameter set covers every active state is checked
         # by ModelLikelihood at fit time, not here. A configuration that only
@@ -829,6 +914,40 @@ class ExperimentConfig(BaseModel):
         # block valid forward-only use.
 
         return self
+
+
+def _warn_on_inert_settings_impl(cfg: ExperimentConfig) -> None:
+    """Warn about settings this pipeline accepts but does not act on.
+
+    A setting that parses, validates, and then does nothing is worse than one
+    that is rejected: the user believes they changed the experiment. These are
+    warnings rather than errors because the fields remain meaningful when the
+    corresponding component is driven directly from Python.
+    """
+    if cfg.inference.n_particles != 500:
+        logger.warning(
+            "inference.n_particles=%s is set, but the pipeline does not "
+            "dispatch the particle backend, so it will not be used. Drive "
+            "umimic.inference.ParticleMCMC directly to use it.",
+            cfg.inference.n_particles,
+        )
+    if cfg.signaling.observed_nodes:
+        logger.warning(
+            "signaling.observed_nodes=%s is set, but nothing in umimic reads "
+            "it; signaling node observations are not implemented.",
+            cfg.signaling.observed_nodes,
+        )
+    if cfg.data.format != "csv":
+        logger.warning(
+            "data.format=%r is set, but the loader only reads CSV; the file "
+            "will be parsed as CSV regardless.",
+            cfg.data.format,
+        )
+    if cfg.coupling.enabled and not cfg.signaling.enabled:
+        logger.warning(
+            "coupling.enabled=True has no effect while signaling.enabled=False: "
+            "the coupling multiplier is only built when signaling runs."
+        )
 
 
 def load_config(path: str | Path) -> ExperimentConfig:

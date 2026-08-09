@@ -163,6 +163,7 @@ class GillespieSimulator:
         lookahead: float = 1.0,
         bound_samples: int = 16,
         bound_safety: float = 1.05,
+        max_bound_refinements: int = 20,
     ):
         """
         Args:
@@ -176,6 +177,10 @@ class GillespieSimulator:
             lookahead: Extrande look-ahead window (hours).
             bound_samples: Grid points used to bound propensities over a window.
             bound_safety: Multiplicative safety factor on that bound.
+            max_bound_refinements: How many times the look-ahead window may be
+                halved when the sampled bound turns out not to dominate the
+                true propensity at a candidate time. Exceeding this raises
+                rather than silently sampling from the wrong process.
         """
         self.rate_set = rate_set
         self.topology = topology
@@ -185,6 +190,7 @@ class GillespieSimulator:
         self.lookahead = float(lookahead)
         self.bound_samples = int(bound_samples)
         self.bound_safety = float(bound_safety)
+        self.max_bound_refinements = int(max_bound_refinements)
 
         if exposure_mode not in ("auto", "constant", "thinning", "direct"):
             raise ValueError(
@@ -296,6 +302,7 @@ class GillespieSimulator:
 
         n_events = 0
         n_rejected = 0
+        n_bound_violations = 0
         truncated = False
         extinct = False
 
@@ -307,25 +314,64 @@ class GillespieSimulator:
             if method == "thinning":
                 # Extrande: bound the propensity over a look-ahead window and
                 # accept a candidate event with probability a0(t)/B.
+                #
+                # B must genuinely dominate a0 over the whole window. It is
+                # estimated from `bound_samples` grid probes, which a PK pulse
+                # narrower than the probe spacing can slip between; `bound_safety`
+                # is a margin, not a proof. When the drawn candidate lands where
+                # a0 > B the acceptance test can never reject, the thinning stops
+                # being a valid rejection sampler, and the trajectory is not a
+                # draw from the CTMC. So verify the bound at the candidate and,
+                # if it fails, discard the candidate and redraw on a halved
+                # window. Discarding is legitimate: the state has not changed and
+                # the exponential clock is memoryless, so no bias is introduced.
                 horizon = min(self.lookahead, t_max - t)
-                B = self._propensity_bound(state, t, horizon)
+                advanced_to_window_end = False
+                B = 0.0
+                a0 = 0.0
+                t_cand = t
+                propensities = np.zeros(len(self.reactions))
+
+                for attempt in range(self.max_bound_refinements + 1):
+                    B = self._propensity_bound(state, t, horizon)
+                    if B <= 0:
+                        break
+
+                    tau = float(self.rng.exponential(1.0 / B))
+                    if tau > horizon:
+                        # No event in this window; advance to its end.
+                        t_next = t + horizon
+                        while rec_idx < len(t_record) and t_record[rec_idx] <= t_next:
+                            recorded[rec_idx] = state
+                            rec_idx += 1
+                        t = t_next
+                        advanced_to_window_end = True
+                        break
+
+                    t_cand = t + tau
+                    propensities = self._propensities(state, t_cand)
+                    a0 = float(np.sum(propensities))
+
+                    if a0 <= B:
+                        break
+
+                    n_bound_violations += 1
+                    horizon *= 0.5
+                    if attempt == self.max_bound_refinements:
+                        raise RuntimeError(
+                            f"Extrande propensity bound was violated at t={t:.6g} "
+                            f"(a0={a0:.6g} > B={B:.6g}) and {self.max_bound_refinements} "
+                            "window halvings did not restore it. The exposure "
+                            "profile varies faster than the bound can resolve. "
+                            "Increase bound_samples, decrease lookahead, or "
+                            "smooth the exposure profile."
+                        )
+
+                if advanced_to_window_end:
+                    continue
                 if B <= 0:
                     extinct = True
                     break
-
-                tau = float(self.rng.exponential(1.0 / B))
-                if tau > horizon:
-                    # No event in this window; advance to its end.
-                    t_next = t + horizon
-                    while rec_idx < len(t_record) and t_record[rec_idx] <= t_next:
-                        recorded[rec_idx] = state
-                        rec_idx += 1
-                    t = t_next
-                    continue
-
-                t_cand = t + tau
-                propensities = self._propensities(state, t_cand)
-                a0 = float(np.sum(propensities))
 
                 while rec_idx < len(t_record) and t_record[rec_idx] <= t_cand:
                     recorded[rec_idx] = state
@@ -406,6 +452,10 @@ class GillespieSimulator:
                 "t_reached": float(t),
                 "extinct": extinct,
                 "n_thinning_rejections": n_rejected,
+                # Non-zero means the grid-sampled bound under-resolved the
+                # exposure and windows had to be halved. The trajectory is
+                # still valid, but bound_samples/lookahead are mistuned.
+                "n_bound_refinements": n_bound_violations,
             },
         )
 

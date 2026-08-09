@@ -50,6 +50,20 @@ class LuciferinKinetics:
     ke_luc: float = 0.05  # 1/min (slow clearance)
     km: float = 50.0  # substrate units
 
+    def __post_init__(self) -> None:
+        if not np.isfinite(self.dose) or self.dose < 0:
+            raise ValueError(f"dose must be finite and non-negative, got {self.dose}.")
+        if not np.isfinite(self.ka_luc) or self.ka_luc <= 0:
+            raise ValueError(
+                f"ka_luc must be a positive rate constant, got {self.ka_luc}."
+            )
+        if not np.isfinite(self.ke_luc) or self.ke_luc <= 0:
+            raise ValueError(
+                f"ke_luc must be a positive rate constant, got {self.ke_luc}."
+            )
+        if not np.isfinite(self.km) or self.km <= 0:
+            raise ValueError(f"km must be a positive constant, got {self.km}.")
+
     @property
     def peak_time(self) -> float:
         """Time of peak luciferin concentration (minutes post-injection).
@@ -60,10 +74,6 @@ class LuciferinKinetics:
         t_max = 1/ka.
         """
         ka, ke = self.ka_luc, self.ke_luc
-        if ka <= 0 or ke <= 0:
-            raise ValueError(
-                f"Luciferin rate constants must be positive, got ka={ka}, ke={ke}."
-            )
         if abs(ka - ke) < 1e-10:
             return float(1.0 / ka)
         return float(np.log(ka / ke) / (ka - ke))
@@ -140,6 +150,17 @@ class TissueAttenuation:
 
     mu_eff: float = 0.5  # mm^-1, effective attenuation coefficient
     reference_depth: float = 2.0  # mm, tissue depth above the tumour
+
+    def __post_init__(self) -> None:
+        if not np.isfinite(self.mu_eff) or self.mu_eff < 0:
+            raise ValueError(
+                f"mu_eff must be finite and non-negative, got {self.mu_eff}."
+            )
+        if not np.isfinite(self.reference_depth) or self.reference_depth < 0:
+            raise ValueError(
+                f"reference_depth must be finite and non-negative, "
+                f"got {self.reference_depth}."
+            )
 
     def attenuation_factor(
         self, depth: float | None = None, volume: float | None = None

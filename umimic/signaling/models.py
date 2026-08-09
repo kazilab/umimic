@@ -37,12 +37,43 @@ class ToyMapkAktNetwork(SignalingNetwork):
     decay: float = 0.5
     direction: str = "inhibitory"
 
+    #: Parameter names the pipeline may forward from config.
+    CONFIG_PARAM_NAMES = frozenset(
+        {
+            "mapk_baseline",
+            "akt_baseline",
+            "mapk_drive",
+            "akt_drive",
+            "decay",
+            "direction",
+        }
+    )
+
     def __post_init__(self) -> None:
         if self.direction not in ("inhibitory", "stimulatory"):
             raise ValueError(
                 f"direction must be 'inhibitory' or 'stimulatory', got "
                 f"{self.direction!r}."
             )
+        for name in ("mapk_baseline", "akt_baseline"):
+            value = float(getattr(self, name))
+            if not np.isfinite(value) or not (0.0 <= value <= 1.0):
+                raise ValueError(
+                    f"{name} must lie in [0, 1], got {value}."
+                )
+            setattr(self, name, value)
+        for name in ("mapk_drive", "akt_drive"):
+            value = float(getattr(self, name))
+            if not np.isfinite(value) or value < 0.0:
+                raise ValueError(
+                    f"{name} must be finite and non-negative, got {value}."
+                )
+            setattr(self, name, value)
+        if not np.isfinite(self.decay) or self.decay <= 0.0:
+            raise ValueError(
+                f"decay must be a positive rate constant, got {self.decay}."
+            )
+        self.decay = float(self.decay)
 
     @property
     def _sign(self) -> float:
@@ -63,13 +94,13 @@ class ToyMapkAktNetwork(SignalingNetwork):
         to a set point (rather than an unbounded drive term) keeps activity in
         [0, 1] instead of growing without limit at high concentration.
         """
-        mapk, akt = y
+        mapk, akt = np.clip(np.asarray(y, dtype=float), 0.0, 1.0)
         c = max(float(concentration), 0.0)
         sign = self._sign
 
         mapk_target = np.clip(self.mapk_baseline + sign * self.mapk_drive * c, 0.0, 1.0)
         akt_target = np.clip(self.akt_baseline + sign * self.akt_drive * c, 0.0, 1.0)
 
-        d_mapk = self.decay * (mapk_target - np.clip(mapk, 0.0, 1.0))
-        d_akt = self.decay * (akt_target - np.clip(akt, 0.0, 1.0))
+        d_mapk = self.decay * (mapk_target - mapk)
+        d_akt = self.decay * (akt_target - akt)
         return np.array([d_mapk, d_akt], dtype=float)

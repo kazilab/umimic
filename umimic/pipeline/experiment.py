@@ -7,6 +7,7 @@ import logging
 from typing import Any, Callable, Sequence
 
 import numpy as np
+from scipy import stats
 from scipy.integrate import solve_ivp
 
 from umimic.pipeline.config import ExperimentConfig
@@ -53,7 +54,13 @@ class Experiment:
 
     def __init__(self, config: ExperimentConfig):
         self.config = config
-        self.rng = np.random.default_rng(config.seed)
+        # simulation.seed takes precedence when set, else the top-level seed.
+        # It used to be declared and validated but never read, so a user who
+        # set it believed they had reseeded the simulation and had not.
+        sim_seed = config.simulation.seed
+        self.rng = np.random.default_rng(
+            config.seed if sim_seed is None else sim_seed
+        )
         self._build_components()
 
     def _build_components(self):
@@ -253,6 +260,7 @@ class Experiment:
                     vd=self.config.pk.vd,
                     ke=self.config.pk.ke,
                     ka=self.config.pk.ka,
+                    f_oral=self.config.pk.f_oral,
                 )
             else:
                 # Explicit None checks: `x or default` would replace a
@@ -264,10 +272,53 @@ class Experiment:
                     cl=1.0 if pkc.cl is None else pkc.cl,
                     q=0.5 if pkc.q is None else pkc.q,
                     ka=pkc.ka,
+                    f_oral=pkc.f_oral,
                 )
 
             dosing = self._build_dosing()
             self.exposure = ExposureProfile.from_pk(pk, dosing)
+
+            # Optionally cache the profile on a grid. Every scalar query
+            # otherwise re-solves the PK ODE from t0 (~3 ms), and the
+            # stochastic simulators call exposure_fn once per event, so a
+            # 1e5-step trajectory spends minutes re-integrating a curve that
+            # never changes.
+            #
+            # This is opt-in and off by default: linear interpolation between
+            # knots is an approximation, and enabling it silently would change
+            # existing numbers. A caller who wants the speed-up asks for it and
+            # picks the resolution. Knots are doubled at every dose and
+            # infusion boundary so discontinuities are not smeared into ramps.
+            per_hour = self.config.pk.cache_resolution
+            if per_hour > 0:
+                sc = self.config.simulation
+                self.exposure.precompute(
+                    self._exposure_grid(dosing, sc.t_max, per_hour)
+                )
+
+    @staticmethod
+    def _exposure_grid(
+        dosing: DosingSchedule, t_max: float, per_hour: float = 4.0
+    ) -> np.ndarray:
+        """Time grid for caching a PK profile.
+
+        A uniform grid plus a knot on each side of every dose and infusion
+        boundary. The doubled knots (t and t+eps) keep a bolus discontinuity
+        from being smeared into a ramp by linear interpolation.
+        """
+        t_max = float(max(t_max, 0.0))
+        grid = [np.linspace(0.0, t_max, max(int(t_max * per_hour) + 1, 2))]
+
+        eps = 1e-9
+        for dose in dosing.doses:
+            edges = [dose.time]
+            if dose.duration > 0:
+                edges.append(dose.time + dose.duration)
+            for edge in edges:
+                grid.append(np.array([edge - eps, edge, edge + eps]))
+
+        t = np.unique(np.concatenate(grid))
+        return t[(t >= 0.0) & (t <= t_max)]
 
     def _build_dosing(self) -> DosingSchedule:
         """Build dosing schedule from config."""
@@ -318,7 +369,10 @@ class Experiment:
         y0 = self._initial_state_vector(sc.initial_cells, rs)
 
         if concentrations is not None:
-            # Dose-response simulation
+            # Dose-response simulation. solve_dose_response takes no rate
+            # multiplier, so coupling would be silently dropped here exactly as
+            # it would be in the stochastic branches below.
+            self._reject_unsupported_signaling("dose_response")
             ode = CellDynamicsODE(rs, self.topology, lambda t, _c=0.0: _c)
             return ode.solve_dose_response(y0, (0, sc.t_max), concentrations, t_eval)
 
@@ -362,28 +416,54 @@ class Experiment:
             model_kwargs = {
                 k: v
                 for k, v in scfg.parameters.items()
-                if k in {"mapk_baseline", "akt_baseline", "mapk_drive", "akt_drive", "decay"}
+                if k in ToyMapkAktNetwork.CONFIG_PARAM_NAMES and k != "direction"
             }
+            # Direction is a config field (not a float parameter dict entry).
+            model_kwargs["direction"] = scfg.direction
             network = ToyMapkAktNetwork(**model_kwargs)
             y0 = network.initial_state().copy()
             if scfg.initial_state:
                 idx_map = {name: i for i, name in enumerate(network.node_names)}
                 for name, value in scfg.initial_state.items():
-                    if name in idx_map:
-                        y0[idx_map[name]] = float(value)
+                    if name not in idx_map:
+                        raise ValueError(
+                            f"Unknown signaling initial_state node {name!r}; "
+                            f"expected one of {network.node_names}."
+                        )
+                    y0[idx_map[name]] = float(value)
+                if np.any(y0 < 0.0) or np.any(y0 > 1.0):
+                    raise ValueError(
+                        "Signaling initial_state values must lie in [0, 1]; "
+                        f"got {y0.tolist()}."
+                    )
             return network, y0
-        return None
+        raise ValueError(
+            f"Unknown signaling model {scfg.model!r}; expected 'none' or "
+            f"'toy_mapk_akt'."
+        )
 
     def _build_signaling_rate_multiplier(
         self, t_eval: np.ndarray
     ) -> tuple[Callable[[float, str], float], dict[str, Any]] | None:
-        """Create signaling-to-rate coupling callback for ODE simulation."""
+        """Create signaling-to-rate coupling callback for ODE simulation.
+
+        Multipliers are ``max(0, 1 + max_effect * e(activity))`` with
+        non-negative ``max_effect``. High pathway activity *boosts* targeted
+        rates above the bare RateSet; suppressed activity returns them toward
+        baseline (factor 1). This is not a free-signed "drug effect on rate"
+        map -- see umimic/signaling/SCIENTIFIC_ASSUMPTIONS.md.
+        """
         signaling = self._build_signaling_network()
         if signaling is None:
             return None
 
         network, y0 = signaling
         t_span = (float(t_eval[0]), float(t_eval[-1]))
+        if t_span[1] < t_span[0]:
+            raise ValueError(
+                f"Signaling integration requires t_eval with non-decreasing "
+                f"span, got {t_span}."
+            )
         sol = solve_ivp(
             lambda t, y: network.rhs(t, y, float(self.exposure(t))),
             t_span=t_span,
@@ -394,11 +474,23 @@ class Experiment:
             atol=1e-8,
         )
         if not sol.success:
-            return None
+            raise RuntimeError(
+                "Signaling ODE integration failed; refusing to run cell "
+                f"dynamics without a valid pathway trajectory: {sol.message}"
+            )
 
         idx_map = {name: i for i, name in enumerate(network.node_names)}
-        mapk = sol.y[idx_map["mapk"]] if "mapk" in idx_map else np.zeros_like(sol.t)
-        akt = sol.y[idx_map["akt"]] if "akt" in idx_map else np.zeros_like(sol.t)
+        # Clip numerical undershoot so activity used in coupling stays in [0, 1].
+        mapk = (
+            np.clip(sol.y[idx_map["mapk"]], 0.0, 1.0)
+            if "mapk" in idx_map
+            else np.zeros_like(sol.t)
+        )
+        akt = (
+            np.clip(sol.y[idx_map["akt"]], 0.0, 1.0)
+            if "akt" in idx_map
+            else np.zeros_like(sol.t)
+        )
 
         cparams = self.config.coupling.parameters
         max_effect_by_target = self.config.coupling.max_effect_by_target
@@ -409,11 +501,16 @@ class Experiment:
         w_mapk = float(cparams.get("mapk_weight", 0.5))
         w_akt = float(cparams.get("akt_weight", 0.5))
         max_effect = float(cparams.get("max_effect", 1.0))
+        if max_effect < 0:
+            raise ValueError(
+                f"coupling max_effect must be non-negative (got {max_effect}); "
+                "the multiplier is 1 + max_effect * e(activity)."
+            )
         ec50 = max(float(cparams.get("ec50", 1.0)), 1e-9)
         hill = max(float(cparams.get("hill", 1.0)), 1e-6)
         logistic_k = float(cparams.get("k", 1.0))
         logistic_center = float(cparams.get("center", 0.5))
-        activity = np.maximum(w_mapk * mapk + w_akt * akt, 0.0)
+        activity = np.clip(w_mapk * mapk + w_akt * akt, 0.0, None)
         targets = set(self.config.coupling.targets)
 
         def applies_to_key(key: str) -> bool:
@@ -463,13 +560,20 @@ class Experiment:
                 return 1.0
             sig = float(np.interp(t, sol.t, activity))
             effect = normalized_effect(max(sig, 0.0), key)
+            # High activity -> rates above RateSet baseline; low activity -> 1.
             return max(0.0, 1.0 + resolve_max_effect(key) * effect)
 
         meta = {
             "enabled": True,
             "model": self.config.signaling.model,
+            "direction": getattr(network, "direction", None),
             "coupling_enabled": self.config.coupling.enabled,
             "coupling_mode": "direct_rate_multiplier",
+            "coupling_formula": "max(0, 1 + max_effect * e(activity))",
+            "coupling_semantics": (
+                "activity boosts targeted rates above the bare RateSet; "
+                "pathway-off returns the multiplier to 1"
+            ),
             "coupling_targets": sorted(targets),
             "max_effect_by_target": dict(max_effect_by_target),
             "ec50_by_target": dict(ec50_by_target),
@@ -486,6 +590,12 @@ class Experiment:
     ) -> ExperimentalDataset:
         """Generate a synthetic dataset using the experiment's configuration."""
         rs = rate_set or self.rate_set
+
+        # SyntheticDataGenerator threads no rate multiplier into any of its
+        # simulators, so signaling coupling would be dropped -- and synthetic
+        # data is the worst place to drop it silently, because the resulting
+        # dataset then gets fitted as though it came from the coupled model.
+        self._reject_unsupported_signaling(f"generate_synthetic/{self.config.simulation.method}")
 
         # Hand over every configured modality. Taking only the first one made
         # a multimodal configuration emit single-modality data, so a
@@ -604,6 +714,36 @@ class Experiment:
             )
         return MultimodalObservation(usable)
 
+    def _apply_prior_overrides(self, spec: PriorSpec) -> None:
+        """Overlay `config.priors` onto the parameter-set prior defaults.
+
+        Until this existed, `config.priors` was read by nothing: the factory
+        chosen by `parameter_set` won unconditionally, so a user tuning
+        `priors.ec50_death` got no effect and no warning -- on a setting that
+        materially moves the MAP and the posterior.
+
+        A section supplying `dist_param_s` becomes lognormal(s, scale); one
+        supplying only `dist_param_scale` becomes half-normal(scale), matching
+        how the defaults in `PriorSpec` are built.
+        """
+        for name, spec_dict in self.config.priors.model_dump().items():
+            if not spec_dict:
+                continue
+            scale = spec_dict.get("dist_param_scale")
+            if scale is None or scale <= 0:
+                raise ValueError(
+                    f"priors.{name}.dist_param_scale must be positive, got {scale!r}."
+                )
+            s = spec_dict.get("dist_param_s")
+            if s is None:
+                spec.add(name, stats.halfnorm(scale=scale))
+            elif s <= 0:
+                raise ValueError(
+                    f"priors.{name}.dist_param_s must be positive, got {s!r}."
+                )
+            else:
+                spec.add(name, stats.lognorm(s=s, scale=scale))
+
     def fit(
         self,
         data: TimeSeriesData | ExperimentalDataset,
@@ -632,6 +772,7 @@ class Experiment:
             "resistance": PriorSpec.default_resistance,
             "persister": PriorSpec.default_persister,
         }[ic.parameter_set]()
+        self._apply_prior_overrides(priors)
 
         # Hand the configured observation models to the likelihood so that
         # every modality the experiment declares actually enters the fit.
@@ -641,9 +782,11 @@ class Experiment:
         self._reject_unsupported_signaling("inference")
 
         # The forward mode determines whether LNA process variance is
-        # available. It is configured independently of the inference backend:
-        # tying it to MLE-vs-MCMC silently disabled the variance signature that
-        # separates birth from death on the default path.
+        # available at all. It is configured independently of the inference
+        # backend: tying it to MLE-vs-MCMC silently discarded the process
+        # variance on the default path. Availability is not power -- see
+        # umimic/inference/SCIENTIFIC_ASSUMPTIONS.md section 2a for when a
+        # birth/death split from counts is and is not supportable.
         likelihood = ModelLikelihood(
             topology=self.topology,
             data=data_list,

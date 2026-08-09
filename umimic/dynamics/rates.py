@@ -212,6 +212,19 @@ class ConstantRate(DoseResponseFunction):
 
     value: float = 0.0
 
+    def __post_init__(self) -> None:
+        # Every sibling class validates; this one did not, and a negative
+        # constant slips through both RateSet guards: it is non-decreasing (so
+        # the monotonicity probe passes) and never exceeds 1 (so the birth-peak
+        # probe passes). ConstantRate(-0.5) then *raises* the division rate by
+        # 50% under drug -- the exact inversion those guards exist to prevent.
+        if not np.isfinite(self.value) or self.value < 0:
+            raise ValueError(
+                f"ConstantRate value must be finite and non-negative, got "
+                f"{self.value}. Modulators express the magnitude of a drug "
+                "effect; a negative value inverts its direction."
+            )
+
     def __call__(self, c: float | np.ndarray) -> float | np.ndarray:
         return np.full_like(np.asarray(c, dtype=float), self.value)
 
@@ -377,6 +390,24 @@ class RateSet:
             (f"transition_induction[{src.name}->{tgt.name}]", fn)
             for (src, tgt), fn in self.transition_induction.items()
         ]
+
+        # Modulators are effect *magnitudes*; a negative value flips the sign
+        # of the drug's action. The monotonicity check below cannot catch this
+        # on its own -- a constant or an offset curve can be non-decreasing and
+        # still negative everywhere.
+        magnitude_probes = np.concatenate([[0.0], np.logspace(-3, 6, 40)])
+        for name, fn in effects:
+            if fn is None:
+                continue
+            floor = float(np.min([float(fn(c)) for c in magnitude_probes]))
+            if floor < -1e-12:
+                raise ValueError(
+                    f"{name} reaches {floor:.4g} < 0. RateSet modulators express "
+                    "the magnitude of a drug effect, so a negative value "
+                    "reverses its direction: a negative death modulation makes "
+                    "the drug protective, and a negative birth modulation makes "
+                    "it mitogenic."
+                )
 
         for name, fn in effects:
             if fn is None or fn.is_increasing():
@@ -785,12 +816,21 @@ class RateSet:
         the topology's crowding total, so this diagnostic agrees with the
         solvers; summing every state (apoptotic included) reported birth = 0
         after a cytotoxic pulse even with the viable population far below K.
+
+        Division is reported per dividing state as ``birth_<STATE>``. A single
+        shared ``birth`` key omitted ``cell_type``, so it always returned the
+        global ``birth_base`` and silently ignored ``birth_base_by_state`` and
+        ``birth_modulation_by_state``: a resistant clone dividing at 0.02 was
+        reported at 0.04. This is the function users reach for to check a
+        resistance model, so it has to be able to represent one.
         """
         total = topology.density_total(state)
         K = topology.carrying_capacity if topology.density_dependent else None
-        rates = {
-            "birth": self.birth_rate(concentration, total, K),
-        }
+        rates = {}
+        for ct in topology.division_states:
+            rates[f"birth_{ct.name}"] = self.birth_rate(
+                concentration, total, K, cell_type=ct
+            )
         for ct in topology.death_states:
             rates[f"death_{ct.name}"] = self.death_rate(ct, concentration)
         for src, tgt in topology.transitions:
@@ -1093,6 +1133,9 @@ class RateSet:
         hill_death: float = 1.5,
         resistance: float = 1.0,
         fitness_cost: float = 0.0,
+        u_PR: float = 1e-6,
+        u_PQ: float = 0.005,
+        u_QP: float = 0.003,
     ) -> RateSet:
         """RateSet for a sensitive P/Q population plus a resistant R clone.
 
@@ -1100,6 +1143,12 @@ class RateSet:
         is scaled by ``1 - resistance``: at ``resistance=1`` the clone is fully
         insensitive and grows under treatment while P is killed, which is the
         behaviour a resistance model has to reproduce.
+
+        The P->R edge is parameterised here rather than left to the class
+        default. ``ModelTopology.four_state`` declares that edge, but the
+        default ``transition_base`` covers only P<->Q, so without ``u_PR`` the
+        transition rate is exactly zero and resistance can never arise de novo
+        -- the clone could only ever appear by seeding R in the initial state.
 
         Args:
             b0: Baseline division rate for P.
@@ -1109,11 +1158,17 @@ class RateSet:
             resistance: 0 = as sensitive as P, 1 = fully resistant.
             fitness_cost: Fractional reduction of R's division rate relative
                 to P, i.e. the cost of carrying resistance.
+            u_PR: P->R acquisition rate per cell per hour. The default is a
+                per-division mutation-scale rate; set it to 0 for a
+                pre-existing-resistance-only model.
+            u_PQ, u_QP: Quiescence entry/exit rates.
         """
         if not 0.0 <= resistance <= 1.0:
             raise ValueError(f"resistance must lie in [0, 1], got {resistance}.")
         if not 0.0 <= fitness_cost < 1.0:
             raise ValueError(f"fitness_cost must lie in [0, 1), got {fitness_cost}.")
+        if u_PR < 0:
+            raise ValueError(f"u_PR must be non-negative, got {u_PR}.")
 
         death_modulation = {
             CellType.P: EmaxHill(emax=emax_death, ec50=ec50_death, hill=hill_death),
@@ -1132,6 +1187,11 @@ class RateSet:
             birth_modulation_by_state={CellType.R: None},
             death_base={CellType.P: d0, CellType.Q: d0 * 0.5, CellType.R: d0},
             death_modulation=death_modulation,
+            transition_base={
+                (CellType.P, CellType.Q): u_PQ,
+                (CellType.Q, CellType.P): u_QP,
+                (CellType.P, CellType.R): u_PR,
+            },
         )
 
     @classmethod
@@ -1150,9 +1210,12 @@ class RateSet:
         """Create a RateSet for a mixed drug: raises death and reduces birth.
 
         The two effects have independent Emax/EC50/Hill parameters, so a mixed
-        agent is not simply the average of the two pure mechanisms. Separating
-        them is what allows cytotoxic and cytostatic action to be distinguished
-        from the variance signature.
+        agent is not simply the average of the two pure mechanisms. Keeping
+        them separate is what would let the variance signature distinguish
+        cytotoxic from cytostatic action -- in principle. That separation is
+        underpowered at realistic counting noise; see
+        umimic/inference/SCIENTIFIC_ASSUMPTIONS.md section 2a before relying
+        on a fitted split.
 
         See :meth:`cytotoxic_drug` for the meaning of `quiescent_sensitivity`;
         the default of 0 leaves quiescent cells refractory to the cytotoxic

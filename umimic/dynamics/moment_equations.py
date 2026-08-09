@@ -29,9 +29,16 @@ class MomentODE:
     - mu(t): mean population vector (n_states)
     - Sigma(t): covariance matrix (n_states x n_states)
 
-    The key insight from BESTDR: variance carries mechanistic information.
-    Different mechanisms (cytostatic vs cytotoxic) produce the same mean
-    but different variance signatures, enabling statistical separation.
+    Variance carries mechanistic information the mean does not: cytostatic
+    and cytotoxic action can produce the same mean trajectory while differing
+    in b + d. This class propagates that variance correctly (ODE/SSA/LNA agree
+    to <0.3% in the mean, 0.92-1.01 in the variance ratio).
+
+    Whether it is *detectable* is a separate question and usually the answer
+    is no: what matters is the process variance as a share of total
+    observation variance, which at the package defaults is ~1.5%. Propagating
+    the signature is not the same as being able to fit on it.
+    See umimic/inference/SCIENTIFIC_ASSUMPTIONS.md section 2a.
     """
 
     def __init__(

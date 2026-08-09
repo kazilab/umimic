@@ -24,7 +24,7 @@ import numpy as np
 
 from umimic.dynamics.gillespie import GillespieSimulator, build_reactions
 from umimic.dynamics.rates import RateSet
-from umimic.dynamics.states import ModelTopology
+from umimic.dynamics.states import CellType, ModelTopology
 from umimic.types import EnsembleResult, SimulationResult
 
 logger = logging.getLogger(__name__)
@@ -47,6 +47,7 @@ class TauLeapingSimulator:
         rng: np.random.Generator | None = None,
         n_critical: int = 10,
         ssa_threshold: float = 100.0,
+        epsilon: float = 0.03,
     ):
         """
         Args:
@@ -57,7 +58,13 @@ class TauLeapingSimulator:
             rng: Random generator.
             n_critical: A reaction is critical if fewer than this many firings
                 would exhaust one of its reactants.
-            ssa_threshold: Below this total population, use the exact SSA.
+            ssa_threshold: Below this total population, use the exact SSA. This
+                is re-checked at every leap, not only at t=0: a population
+                driven toward extinction has to hand back to the exact method
+                when it gets there.
+            epsilon: Error control for the leap condition. The adaptive step
+                keeps the expected relative change in every population below
+                roughly this value. Smaller is more accurate and slower.
         """
         if not tau > 0:
             raise ValueError(f"tau must be positive, got {tau}.")
@@ -66,10 +73,69 @@ class TauLeapingSimulator:
         self.exposure_fn = exposure_fn
         self.tau = float(tau)
         self.rng = rng or np.random.default_rng()
+        if not epsilon > 0:
+            raise ValueError(f"epsilon must be positive, got {epsilon}.")
         self.n_critical = int(n_critical)
         self.ssa_threshold = float(ssa_threshold)
+        self.epsilon = float(epsilon)
         self.reactions = build_reactions(rate_set, topology)
         self._stoich = np.array([r.stoichiometry for r in self.reactions], dtype=float)
+
+    def _reactive_population(self, state: np.ndarray) -> float:
+        """Population that can still drive reactions.
+
+        The apoptotic compartment is excluded: corpses accumulate and only
+        leave via clearance, so counting them keeps the total high while the
+        living population -- the one whose smallness invalidates the Poisson
+        leap -- goes to zero. Summing everything let a culture dying out sit
+        above ssa_threshold on the strength of its own corpses.
+        """
+        x = np.maximum(np.asarray(state, dtype=float), 0.0)
+        total = 0.0
+        for i, ct in enumerate(self.topology.active_states):
+            if ct is CellType.A:
+                continue
+            total += float(x[i])
+        return total
+
+    def _leap_condition_tau(
+        self, state: np.ndarray, propensities: np.ndarray, non_critical: np.ndarray
+    ) -> float:
+        """Largest leap satisfying the Cao-Gillespie-Petzold error control.
+
+        Bounds the mean and standard deviation of the change in each species
+        over the leap by ``max(epsilon * x_i / g_i, 1)``:
+
+            tau = min_i min( bound_i / |mu_i|, bound_i**2 / sigma2_i )
+
+        with ``mu = nu^T a`` and ``sigma2 = (nu**2)^T a`` over the non-critical
+        reactions. Without this the leap size is whatever the user passed,
+        and the resulting bias is silent -- a fixed tau of 20 h understates the
+        apoptotic count by ~8% with nothing in the output to say so.
+        """
+        if not np.any(non_critical):
+            return np.inf
+
+        a = propensities[non_critical]
+        nu = self._stoich[non_critical]
+        mu = nu.T @ a
+        sigma2 = (nu**2).T @ a
+
+        # Highest order of reaction in which each species appears. Every
+        # reaction here is first order in its reactant, except that
+        # density-dependent birth makes the propensity quadratic in the
+        # crowding population.
+        g = 2.0 if self.topology.density_dependent else 1.0
+        bound = np.maximum(self.epsilon * np.maximum(state, 0.0) / g, 1.0)
+
+        tau = np.inf
+        with np.errstate(divide="ignore", invalid="ignore"):
+            mean_limit = np.where(np.abs(mu) > 0, bound / np.abs(mu), np.inf)
+            var_limit = np.where(sigma2 > 0, bound**2 / sigma2, np.inf)
+        candidate = float(min(np.min(mean_limit), np.min(var_limit)))
+        if np.isfinite(candidate) and candidate > 0:
+            tau = candidate
+        return tau
 
     def _critical_mask(
         self, state: np.ndarray, propensities: np.ndarray
@@ -112,7 +178,7 @@ class TauLeapingSimulator:
         t_record = np.asarray(t_record, dtype=float)
 
         # Small populations: the leap approximation is not valid, use exact SSA.
-        if float(np.sum(np.maximum(x0, 0))) < self.ssa_threshold:
+        if self._reactive_population(x0) < self.ssa_threshold:
             ssa = GillespieSimulator(
                 self.rate_set, self.topology, self.exposure_fn, self.rng
             )
@@ -136,7 +202,17 @@ class TauLeapingSimulator:
         n_critical_fired = 0
         tau_min = np.inf
 
+        ssa_handoff_time: float | None = None
+
         while t < t_max:
+            # The leap approximation stops being valid when the population gets
+            # small, and a trajectory heading for extinction gets there mid-run.
+            # Checking only the initial state let a run that started at 5000
+            # leap all the way down through single digits.
+            if self._reactive_population(state) < self.ssa_threshold:
+                ssa_handoff_time = t
+                break
+
             conc = self.exposure_fn(t)
             total = self.topology.density_total(state)
             propensities = np.array(
@@ -151,8 +227,10 @@ class TauLeapingSimulator:
             crit = self._critical_mask(state, propensities)
             a_crit = float(np.sum(propensities[crit]))
 
-            # Candidate leap for the non-critical reactions.
-            tau_leap = min(self.tau, t_max - t)
+            # Candidate leap for the non-critical reactions: the error-control
+            # step, capped by the user's nominal tau and the remaining time.
+            tau_adaptive = self._leap_condition_tau(state, propensities, ~crit)
+            tau_leap = min(self.tau, tau_adaptive, t_max - t)
 
             # Time to the next critical (exactly simulated) reaction.
             if a_crit > 0:
@@ -259,6 +337,26 @@ class TauLeapingSimulator:
             t = t_next
             n_leaps += 1
 
+        if ssa_handoff_time is not None and rec_idx < len(t_record):
+            # Finish the trajectory exactly. The SSA runs on its own clock from
+            # 0, so shift the remaining record times into its frame and shift
+            # them back when merging.
+            remaining = t_record[rec_idx:] - ssa_handoff_time
+            ssa = GillespieSimulator(
+                self.rate_set,
+                self.topology,
+                lambda s, _t0=ssa_handoff_time: self.exposure_fn(_t0 + s),
+                self.rng,
+            )
+            tail = ssa.simulate(
+                state,
+                max(t_max - ssa_handoff_time, 0.0),
+                np.maximum(remaining, 0.0),
+            )
+            for i, ct in enumerate(self.topology.active_states):
+                recorded[rec_idx:, i] = tail.populations[ct.name]
+            rec_idx = len(t_record)
+
         # Remaining record slots (including t_max itself) take the final state.
         while rec_idx < len(t_record):
             recorded[rec_idx] = state
@@ -279,8 +377,15 @@ class TauLeapingSimulator:
             times=t_record,
             populations=populations,
             metadata={
-                "method": "tau_leaping",
+                "method": (
+                    "tau_leaping(ssa_tail)"
+                    if ssa_handoff_time is not None
+                    else "tau_leaping"
+                ),
                 "tau": self.tau,
+                "epsilon": self.epsilon,
+                "ssa_threshold": self.ssa_threshold,
+                "ssa_handoff_time": ssa_handoff_time,
                 "n_leaps": n_leaps,
                 "n_rejected_leaps": n_rejected,
                 "n_critical_events": n_critical_fired,

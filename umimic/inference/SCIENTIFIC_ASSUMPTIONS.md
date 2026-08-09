@@ -37,7 +37,7 @@ prior.
 | Set | Contents | Scientific role |
 |-----|----------|-----------------|
 | `default` | Cytotoxic death modulation + P/Q transitions + overdispersion | Pure cytotoxic drug; **cannot** separate cytostatic vs cytotoxic action |
-| `mechanism` | Default + birth Emax/EC50/Hill | Both mechanisms; **requires** `mode="moment"` — mean confounds \(b-d\), LNA variance scales with \(b+d\) |
+| `mechanism` | Default + birth Emax/EC50/Hill | Both mechanisms; **requires** `mode="moment"`, and see §2a — the variance route is real in theory but underpowered at realistic noise |
 | `resistance` | + \(b0_R\), \(d0_R\), residual R death, \(u_{PR}\) | Avoids an immortal, fully fit R clone |
 | `persister` | + Q rates, induced Q→R, Q drug sensitivity | Persister route; induction efficacy by default |
 
@@ -54,6 +54,62 @@ prior.
 Topology states without their own rate parameters are rejected when they
 would become immortal clones (dividing state missing `b0_*`, dying state
 missing `d0_*` except documented Q fallback).
+
+---
+
+## 2a. Separating birth from death: what is and is not supported
+
+This is the package's most load-bearing claim, so it is stated precisely.
+
+**The theory is correct.** For a linear birth–death process the mean scales
+with \(b-d\) and the variance with \(b+d\), so the variance does carry
+information the mean cannot. `MomentODE` propagates that variance correctly:
+the ODE/SSA/LNA cross-check agrees to <0.3% in the mean and 0.92–1.01 in the
+variance ratio.
+
+**The practical claim does not follow, and measurements say it usually
+fails.** What matters is not whether the process variance exists but what
+*share of the total observation variance* it represents:
+
+\[ \text{share} = \frac{\mathrm{Var}_\text{process}}{\mathrm{Var}_\text{process} + \mu + \mu^2/\phi} \]
+
+At this package's own defaults (\(\phi=10\), \(\mu\approx4000\), 72 h) that
+share is **~1.5%**. A *doubling* of turnover then moves the log-likelihood by
+**~1 nat across an entire dataset**, against the ~2 nats per parameter that
+AIC needs to prefer a model. Measured consequences:
+
+- Mechanism discrimination (cytotoxic vs cytostatic, means matched to
+  0.000 by construction) is **at chance**: 5/11 correct across 3 seeds ×
+  {1,5} restarts, with |ΔAIC| < 0.6 in 10 of 11 valid comparisons.
+- Recovering the truth requires counts near the Poisson limit
+  (\(\phi \gg 100\)) *and* ~10³ independent trajectories. A plate assay
+  provides neither.
+- On real plates a third variance source — between-well seeding spread —
+  is larger than either, and is what `sigma_extrinsic` exists to absorb.
+  Without it that spread is misattributed to demography and inflates
+  \(b+d\) several-fold.
+
+**External check.** BESTDR (McDonald et al.) infers \(b\) and \(d\) from the
+same live-count variance, assuming *all* of it is demographic. Run verbatim on
+its own published HCT116/cisplatin data, that assumption yields
+\(b\approx0.44\,\mathrm{h^{-1}}\) — a division every 1.6 h for a line that
+doubles in ~20 h — and mispredicts the *measured* dead-cell channel with
+RMSE 0.53–0.56. Fitting the same data here with `mode="ode"` gives RMSE 0.089,
+but with \(d0_P\) sitting on its prior median: this package is not measuring
+death either, it is reporting the prior and (correctly) a wide interval.
+
+**Therefore:**
+
+- Treat any \(b\)/\(d\) split obtained from counts alone as **prior-dominated
+  unless you have shown otherwise for your design**. Report the interval, not
+  the point estimate.
+- `mode="moment"` is **not** recommended below \(\phi\approx100\);
+  `CellCountObservation` warns when the skew of the total observation
+  distribution exceeds 0.2, which is the regime where it also becomes biased.
+- The identifying information for \(d\) lives in a *second observable*, not in
+  count fluctuations: a measured dead-cell channel, or clonal resolution
+  (barcodes / limiting dilution), where the extinction fraction gives \(d/b\)
+  directly and in closed form.
 
 ---
 

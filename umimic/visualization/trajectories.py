@@ -93,19 +93,23 @@ def plot_ensemble(
     states: list[str] | None = None,
     show_mean: bool = True,
     show_ci: bool = True,
+    ci_method: str = "percentile",
     alpha_traj: float = 0.05,
     max_trajectories: int = 100,
     ax: plt.Axes | None = None,
     title: str | None = None,
 ) -> plt.Figure:
-    """Plot stochastic ensemble trajectories with mean and CI.
+    """Plot stochastic ensemble trajectories with mean and uncertainty band.
 
     Args:
         ensemble: EnsembleResult from Gillespie/tau-leaping.
         data: Optional observed data to overlay.
         states: Which states to plot.
         show_mean: Show ensemble mean.
-        show_ci: Show 95% credible interval bands.
+        show_ci: Show 95% uncertainty bands.
+        ci_method: ``"percentile"`` (default) uses the 2.5th/97.5th percentiles
+            across trajectories (nonparametric, preferred for counts).
+            ``"gaussian"`` uses mean ± 1.96·SD (parametric approximation).
         alpha_traj: Opacity for individual trajectories.
         max_trajectories: Max individual trajectories to draw.
         ax: Matplotlib axes.
@@ -116,6 +120,11 @@ def plot_ensemble(
         fig, ax = plt.subplots()
     else:
         fig = ax.figure
+
+    if ci_method not in ("percentile", "gaussian"):
+        raise ValueError(
+            f"ci_method must be 'percentile' or 'gaussian', got {ci_method!r}."
+        )
 
     means = ensemble.mean()
     stds = ensemble.std()
@@ -149,15 +158,32 @@ def plot_ensemble(
                 **MEAN_STYLE,
             )
 
-        # 95% CI
+        # 95% band across the ensemble
         if show_ci:
-            lo = means[state_name] - 1.96 * stds[state_name]
-            hi = means[state_name] + 1.96 * stds[state_name]
+            stack = np.array(
+                [
+                    traj[state_name]
+                    for traj in ensemble.trajectories
+                    if state_name in traj
+                ],
+                dtype=float,
+            )
+            if stack.size == 0:
+                continue
+            if ci_method == "percentile":
+                lo = np.percentile(stack, 2.5, axis=0)
+                hi = np.percentile(stack, 97.5, axis=0)
+                band_label = f"{state_name} (2.5–97.5%)"
+            else:
+                lo = means[state_name] - 1.96 * stds[state_name]
+                hi = means[state_name] + 1.96 * stds[state_name]
+                band_label = f"{state_name} (±1.96 SD)"
             ax.fill_between(
                 ensemble.times,
                 np.maximum(lo, 0),
                 hi,
                 color=color,
+                label=band_label if show_mean else None,
                 **CI_STYLE,
             )
 

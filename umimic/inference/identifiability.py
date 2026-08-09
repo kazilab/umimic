@@ -157,45 +157,136 @@ def analyze_identifiability(
 def likelihood_identifiability(
     likelihood,
     theta: np.ndarray,
+    *,
+    step: float = 0.01,
+    threshold: float = 1e-6,
     **kwargs,
 ) -> IdentifiabilityReport:
-    """Convenience wrapper for a :class:`~umimic.inference.likelihood.ModelLikelihood`.
+    """Practical identifiability for a :class:`~umimic.inference.likelihood.ModelLikelihood`.
 
-    Predicts the expected observation for every modality the likelihood uses,
-    concatenated, so the report reflects the actual measurement design rather
-    than counts alone.
+    Uses the curvature of the log-likelihood -- the observed Fisher
+    information ``-d2 l / d log(theta)^2`` -- rather than the sensitivity of
+    the predicted *mean*.
+
+    That distinction matters. A mean-based analysis can only see parameters
+    that move ``expected_value``, so every observation-noise parameter
+    (``overdispersion``, ``sigma_log_bli``, ``sigma_v``,
+    ``biomarker_precision``) gets an exactly zero column and is reported
+    "unidentifiable" no matter how well the data pins it down. Those
+    parameters appear in most of the shipped parameter sets and are typically
+    among the best determined, so the old verdict was not conservative, it was
+    wrong -- and it told users to drop identified parameters.
+
+    Evaluate this at or near a maximum. The observed information is only
+    positive semi-definite at a stationary point; away from one the
+    log-likelihood curves upward along some directions, those eigenvalues come
+    out negative, and they are clipped to zero here (no information rather than
+    negative information). The scores stay meaningful, but ``n_identifiable``
+    undercounts, so prefer a fitted theta -- e.g. ``MLEResult.parameters`` --
+    over a hand-picked one.
+
+    Args:
+        likelihood: The ModelLikelihood to analyse.
+        theta: Parameter vector to analyse at. Identifiability is local, so
+            use a fitted or otherwise plausible operating point.
+        step: Relative finite-difference step on each parameter.
+        threshold: Eigenvalues below ``threshold * max`` count as null.
+
+    Returns:
+        An :class:`IdentifiabilityReport`. Its ``singular_values`` are the
+        square roots of the information eigenvalues, so the condition number
+        keeps the same meaning as in :func:`analyze_identifiability`.
     """
-    params = likelihood.theta_to_params(np.asarray(theta, dtype=float))
+    if kwargs:
+        raise TypeError(
+            f"Unexpected arguments {sorted(kwargs)}. This function now takes "
+            "`step` and `threshold` only; it no longer forwards to "
+            "analyze_identifiability."
+        )
 
-    def predict(p: dict[str, float]) -> np.ndarray:
-        rate_set = likelihood._build_rate_set(p)
-        pieces = []
-        for conc, series in likelihood._conc_groups.items():
-            times = likelihood._group_times[conc]
-            if len(times) < 2:
-                continue
-            t_sol, means, _ = likelihood._solve_forward(
-                rate_set, conc, times, likelihood._initial_state(series[0], rate_set)
-            )
-            for data in series:
-                idx = np.clip(np.searchsorted(t_sol, data.times), 0, len(t_sol) - 1)
-                latent = np.maximum(means[idx], 0.0)
-                for modality in likelihood._active_modalities:
-                    if not data.has_modality(modality):
-                        continue
-                    model = likelihood._modality_models[modality]
-                    # Same points the likelihood scores: the anchor used to
-                    # set the initial condition is not a free observation.
-                    mask = likelihood.scored_mask(data, modality)
-                    pieces.append(
-                        np.array(
-                            [model.expected_value(s) for s in latent[mask]],
-                            dtype=float,
-                        )
-                    )
-        stacked = np.concatenate(pieces) if pieces else np.zeros(0)
-        # Work on a log scale where the observable is positive, matching the
-        # multiplicative noise these modalities carry.
-        return np.log(np.maximum(stacked, 1e-300))
+    theta = np.asarray(theta, dtype=float)
+    names = list(likelihood.param_names)
+    n = len(names)
 
-    return analyze_identifiability(predict, params, likelihood.param_names, **kwargs)
+    # Work in log-parameters so columns are comparable across units. A
+    # parameter sitting at exactly zero has no log scale; it is excluded and
+    # reported as unassessable rather than silently scored 0.
+    if np.any(theta == 0):
+        zeros = [names[i] for i in np.flatnonzero(theta == 0)]
+        logger.warning(
+            "Parameter(s) %s are exactly zero, so log-scale curvature is "
+            "undefined and they are reported as unidentifiable.", zeros,
+        )
+
+    def ll_at(log_theta: np.ndarray) -> float:
+        value = likelihood(np.exp(log_theta))
+        return float(value)
+
+    with np.errstate(divide="ignore"):
+        log_theta0 = np.log(np.abs(theta))
+    log_theta0 = np.where(theta == 0, 0.0, log_theta0)
+
+    h = np.log1p(step)
+    base = ll_at(log_theta0)
+    if not np.isfinite(base):
+        raise ValueError(
+            "Log-likelihood is not finite at the requested point, so its "
+            "curvature is undefined."
+        )
+
+    hessian = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i, n):
+            ei = np.zeros(n)
+            ei[i] = h
+            ej = np.zeros(n)
+            ej[j] = h
+            if i == j:
+                f_p = ll_at(log_theta0 + ei)
+                f_m = ll_at(log_theta0 - ei)
+                value = (f_p - 2.0 * base + f_m) / h**2
+            else:
+                f_pp = ll_at(log_theta0 + ei + ej)
+                f_pm = ll_at(log_theta0 + ei - ej)
+                f_mp = ll_at(log_theta0 - ei + ej)
+                f_mm = ll_at(log_theta0 - ei - ej)
+                value = (f_pp - f_pm - f_mp + f_mm) / (4.0 * h**2)
+            if not np.isfinite(value):
+                # A non-finite stencil point means the likelihood is undefined
+                # nearby (a bound, or a failed solve). Treating that direction
+                # as carrying no information is the conservative reading.
+                value = 0.0
+            hessian[i, j] = hessian[j, i] = value
+
+    fisher = -(hessian + hessian.T) / 2.0
+    # Parameters pinned at zero carry no log-scale information.
+    for i in np.flatnonzero(theta == 0):
+        fisher[i, :] = 0.0
+        fisher[:, i] = 0.0
+
+    eigenvalues, eigenvectors = np.linalg.eigh(fisher)
+    # A negative eigenvalue means the point is not a maximum along that
+    # direction; it carries no usable information either way.
+    eigenvalues = np.maximum(eigenvalues, 0.0)
+    order = np.argsort(eigenvalues)[::-1]
+    eigenvalues = eigenvalues[order]
+    vt = eigenvectors[:, order].T
+
+    singular_values = np.sqrt(eigenvalues)
+    if singular_values[0] <= 0:
+        scores = np.zeros(n)
+        null = vt
+    else:
+        keep = singular_values > singular_values[0] * threshold
+        scores = (
+            np.sqrt((vt[keep] ** 2).sum(axis=0)) if keep.any() else np.zeros(n)
+        )
+        null = vt[~keep]
+
+    return IdentifiabilityReport(
+        param_names=names,
+        singular_values=singular_values,
+        scores=scores,
+        null_directions=null,
+        threshold=threshold,
+    )

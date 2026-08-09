@@ -30,7 +30,6 @@ import numpy as np
 from umimic.data.schemas import TimeSeriesData
 from umimic.dynamics.moment_equations import MomentODE
 from umimic.observations.base import (
-    EKFUpdate,
     ObservationModel,
     TopologyAwareObservation,
 )
@@ -93,16 +92,21 @@ class ExtendedKalmanFilter:
         """Whether a model overrides the default (None) linearization."""
         return type(model).linearize is not ObservationModel.linearize
 
-    def _updates_at(
+    def _observed_at(
         self,
         data: TimeSeriesData,
         k: int,
-        mu: np.ndarray,
-        params: dict | None,
         skip_modality: str | None = None,
-    ) -> list[EKFUpdate]:
-        """Linearized updates for every modality observed at time index k."""
-        updates = []
+    ) -> list[tuple[ObservationModel, float]]:
+        """Modalities with a finite observation at time index k.
+
+        Linearization deliberately happens in the caller, not here. Each
+        modality must linearize against the state left by the preceding
+        modality's update; building the whole list up front would evaluate
+        every ``z_pred`` at the pre-update mean, which is not the sequential
+        decomposition of a joint update.
+        """
+        observed = []
         for modality, model in self._modality_models.items():
             if modality == skip_modality:
                 continue
@@ -114,10 +118,8 @@ class ExtendedKalmanFilter:
                 # previously produced a NaN innovation that propagated into
                 # the marginal likelihood for every later time point.
                 continue
-            update = model.linearize(float(value), mu, params)
-            if update is not None:
-                updates.append(update)
-        return updates
+            observed.append((model, float(value)))
+        return observed
 
     def filter(
         self,
@@ -196,9 +198,16 @@ class ExtendedKalmanFilter:
 
             # Update step: one scalar update per observed modality, applied
             # sequentially. Conditional independence given the latent state
-            # makes this equivalent to a joint update with block-diagonal R.
+            # makes this equivalent to a joint update with block-diagonal R --
+            # but only if each modality is linearized against the state left by
+            # the previous one. Linearizing all of them against the pre-update
+            # mean uses a stale z_pred and gives both the wrong posterior and
+            # the wrong marginal likelihood.
             skip = anchor_modality if k == anchor_index else None
-            for update in self._updates_at(data, k, mu, params, skip):
+            for model, value in self._observed_at(data, k, skip):
+                update = model.linearize(value, mu, params)
+                if update is None:
+                    continue
                 h = np.asarray(update.H, dtype=float).ravel()
                 innov = update.z - update.z_pred
                 S = float(h @ Sigma @ h) + update.R

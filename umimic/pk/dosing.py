@@ -4,15 +4,44 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import numpy as np
+
+VALID_ROUTES = ("iv_bolus", "iv_infusion", "oral")
+
 
 @dataclass
 class Dose:
-    """A single drug administration event."""
+    """A single drug administration event.
+
+    Times and durations are in **hours** (same unit as compartment PK).
+    """
 
     time: float
     amount: float
     route: str = "iv_bolus"  # "iv_bolus", "iv_infusion", "oral"
     duration: float = 0.0  # for infusions (hours)
+
+    def __post_init__(self) -> None:
+        if not np.isfinite(self.time):
+            raise ValueError(f"Dose time must be finite, got {self.time}.")
+        if not np.isfinite(self.amount) or self.amount < 0:
+            raise ValueError(
+                f"Dose amount must be finite and non-negative, got {self.amount}."
+            )
+        if self.route not in VALID_ROUTES:
+            raise ValueError(
+                f"Unknown dosing route {self.route!r}; expected one of "
+                f"{VALID_ROUTES}."
+            )
+        if not np.isfinite(self.duration) or self.duration < 0:
+            raise ValueError(
+                f"Dose duration must be finite and non-negative, got {self.duration}."
+            )
+        if self.route == "iv_infusion" and not self.duration > 0:
+            raise ValueError(
+                "An 'iv_infusion' dose requires a positive duration; "
+                f"got duration={self.duration}."
+            )
 
 
 @dataclass
@@ -20,6 +49,16 @@ class DosingSchedule:
     """Complete dosing schedule for an experiment."""
 
     doses: list[Dose] = field(default_factory=list)
+    #: When set, exposure is a constant in vitro concentration (no PK).
+    fixed_concentration: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.fixed_concentration is not None:
+            c = self.fixed_concentration
+            if not np.isfinite(c) or c < 0:
+                raise ValueError(
+                    f"fixed_concentration must be finite and non-negative, got {c}."
+                )
 
     @classmethod
     def constant_invitro(cls, concentration: float) -> DosingSchedule:
@@ -27,9 +66,7 @@ class DosingSchedule:
 
         This is a sentinel that tells ExposureProfile to return a constant.
         """
-        schedule = cls(doses=[])
-        schedule._constant_concentration = concentration
-        return schedule
+        return cls(doses=[], fixed_concentration=float(concentration))
 
     @classmethod
     def single_bolus(cls, dose_amount: float, time: float = 0.0) -> DosingSchedule:
@@ -78,11 +115,11 @@ class DosingSchedule:
     @property
     def is_constant(self) -> bool:
         """True if this is an in vitro constant concentration."""
-        return hasattr(self, "_constant_concentration")
+        return self.fixed_concentration is not None
 
     @property
     def constant_concentration(self) -> float | None:
-        return getattr(self, "_constant_concentration", None)
+        return self.fixed_concentration
 
     @property
     def total_dose(self) -> float:

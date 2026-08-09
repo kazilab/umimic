@@ -204,13 +204,18 @@ class ObservationModel(ABC):
         latent_state: np.ndarray,
         rng: np.random.Generator,
         params: dict | None = None,
+        process_variance: float | None = None,
     ) -> float | np.ndarray:
         """Generate a synthetic observation from the latent state.
 
         Args:
             latent_state: Latent cell population state vector.
             rng: Random number generator.
-            params: Optional additional parameters.
+            params: Optional additional parameters (same keys as log-likelihood).
+            process_variance: Optional LNA process variance for the projected
+                population. When provided, sampling uses the same noise model
+                as :meth:`log_likelihood` (measurement + process), so posterior
+                predictive checks are not overconfident in moment mode.
         """
         ...
 

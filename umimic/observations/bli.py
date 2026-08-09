@@ -45,6 +45,7 @@ class BLIObservation(TopologyAwareObservation, ObservationModel):
         attenuation: TissueAttenuation | None = None,
         imaging_time_post_injection: float | None = None,
         topology: ModelTopology | None = None,
+        lod: float = 0.0,
     ):
         """
         Args:
@@ -54,8 +55,15 @@ class BLIObservation(TopologyAwareObservation, ObservationModel):
             attenuation: Tissue attenuation model (None = no attenuation).
             imaging_time_post_injection: Time of imaging after luciferin (minutes).
             topology: Model topology, used to identify viable states.
+            lod: Limit of detection in the same units as the signal (photon
+                flux). Readings at or below it are scored as left-censored
+                rather than exact. 0 disables censoring, in which case a
+                non-positive reading is an error rather than a silent -inf.
         """
         TopologyAwareObservation.__init__(self, topology)
+        if not np.isfinite(lod) or lod < 0:
+            raise ValueError(f"lod must be finite and non-negative, got {lod}.")
+        self.lod = float(lod)
         if not np.isfinite(sigma_log) or sigma_log <= 0:
             raise ValueError(f"sigma_log must be positive, got {sigma_log}.")
         if not np.isfinite(alpha) or alpha <= 0:
@@ -69,6 +77,27 @@ class BLIObservation(TopologyAwareObservation, ObservationModel):
     def _get_viable(self, latent_state: np.ndarray) -> float:
         """Extract viable (luciferase+) cells from state vector."""
         return self._project("viable", latent_state)
+
+    def _lod(self, params: dict | None = None) -> float:
+        """Limit of detection, overridable per call via params."""
+        if params and "bli_lod" in params:
+            return float(params["bli_lod"])
+        return self.lod
+
+    def _sigma(self, params: dict | None = None) -> float:
+        """Log-scale measurement SD; inference key is ``sigma_log_bli``.
+
+        Accepts the legacy alias ``sigma_log`` for backwards compatibility.
+        """
+        sigma = self.sigma_log
+        if params:
+            if "sigma_log_bli" in params:
+                sigma = float(params["sigma_log_bli"])
+            elif "sigma_log" in params:
+                sigma = float(params["sigma_log"])
+        if not np.isfinite(sigma) or sigma <= 0:
+            raise ValueError(f"sigma_log_bli must be positive, got {sigma}.")
+        return sigma
 
     def _expected_signal(
         self,
@@ -123,19 +152,29 @@ class BLIObservation(TopologyAwareObservation, ObservationModel):
         contribution of ``Var_process / N_viable**2``.
         """
         mu = self._expected_signal(latent_state, params)
-        sigma = self.sigma_log
-        if params and "sigma_log_bli" in params:
-            sigma = float(params["sigma_log_bli"])
-        if not np.isfinite(sigma) or sigma <= 0:
-            raise ValueError(f"sigma_log_bli must be positive, got {sigma}.")
-
-        sigma = self._with_process_variance(sigma, latent_state, process_variance)
+        sigma = self._with_process_variance(
+            self._sigma(params), latent_state, process_variance
+        )
 
         obs_val = float(observed)
-        if not np.isfinite(obs_val) or obs_val <= 0:
+        if not np.isfinite(obs_val):
             raise ValueError(
-                f"BLI observations must be finite and strictly positive under a "
-                f"lognormal model, got {observed!r}."
+                f"BLI observations must be finite, got {observed!r}. Use NaN "
+                "for a missing measurement so it is masked out."
+            )
+        lod = self._lod(params)
+        if lod > 0 and obs_val <= lod:
+            # Left-censored: below background/dark-count. Scoring log P(Y <= lod)
+            # keeps the point in the fit instead of aborting on it, which is
+            # what a below-threshold IVIS reading used to do.
+            return float(stats.lognorm.logcdf(lod, s=sigma, scale=mu))
+        if obs_val <= 0:
+            raise ValueError(
+                f"BLI observation {observed!r} is not positive, and no limit of "
+                "detection is set (lod=0), so it cannot be scored: a lognormal "
+                "puts zero probability at or below 0. Pass lod=<background "
+                "photon flux> to treat such readings as left-censored, or NaN "
+                "to mark the point missing."
             )
         return float(stats.lognorm.logpdf(obs_val, s=sigma, scale=mu))
 
@@ -191,10 +230,19 @@ class BLIObservation(TopologyAwareObservation, ObservationModel):
         latent_state: np.ndarray,
         rng: np.random.Generator,
         params: dict | None = None,
+        process_variance: float | None = None,
     ) -> float:
-        """Sample a BLI observation."""
+        """Sample a BLI observation (lognormal; optional process variance)."""
         mu = self._expected_signal(latent_state, params)
-        return float(rng.lognormal(np.log(mu), self.sigma_log))
+        sigma = self._with_process_variance(
+            self._sigma(params), latent_state, process_variance
+        )
+        draw = float(rng.lognormal(np.log(mu), sigma))
+        # Censor at the detection limit so simulated data has the same
+        # shape as real data, and so posterior predictive checks compare
+        # like with like against the censored likelihood.
+        lod = self._lod(params)
+        return 0.0 if lod > 0 and draw <= lod else draw
 
     def linearize(
         self,
@@ -218,12 +266,7 @@ class BLIObservation(TopologyAwareObservation, ObservationModel):
         if not np.isfinite(n_viable) or n_viable <= 0:
             return None
 
-        sigma = self.sigma_log
-        if params and "sigma_log_bli" in params:
-            sigma = float(params["sigma_log_bli"])
-        if not np.isfinite(sigma) or sigma <= 0:
-            raise ValueError(f"sigma_log_bli must be positive, got {sigma}.")
-
+        sigma = self._sigma(params)
         return EKFUpdate(
             z=float(np.log(obs_val)),
             z_pred=float(np.log(self._expected_signal(x, params))),
@@ -236,4 +279,6 @@ class BLIObservation(TopologyAwareObservation, ObservationModel):
         return self._expected_signal(latent_state)
 
     def param_names(self) -> list[str]:
-        return ["alpha", "sigma_log"]
+        # alpha is a fixed calibration; sigma_log_bli is the free noise key
+        # used by ModelLikelihood / OBSERVATION_PARAM_NAMES.
+        return ["alpha", "sigma_log_bli"]

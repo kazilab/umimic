@@ -38,6 +38,7 @@ class TumorVolumeObservation(TopologyAwareObservation, ObservationModel):
         beta: float = 1e-5,
         sigma_v: float = 0.2,
         topology: ModelTopology | None = None,
+        lod: float = 0.0,
     ):
         """
         Args:
@@ -47,21 +48,46 @@ class TumorVolumeObservation(TopologyAwareObservation, ObservationModel):
                 corresponds to roughly 1e7 cells.
             sigma_v: Log-scale standard deviation of volume measurement noise.
             topology: Model topology, used to identify viable states.
+            lod: Limit of detection (mm^3). Readings at or below this are
+                scored as left-censored, ``log P(Y <= lod)``, rather than as
+                exact values -- which is how a non-palpable tumour recorded as
+                0 should be treated. 0 disables censoring; a non-positive
+                reading is then an error, because a lognormal assigns zero
+                probability at or below 0 and censoring there would contribute
+                -inf.
         """
         TopologyAwareObservation.__init__(self, topology)
         if not np.isfinite(beta) or beta <= 0:
             raise ValueError(f"beta must be positive, got {beta}.")
         if not np.isfinite(sigma_v) or sigma_v <= 0:
             raise ValueError(f"sigma_v must be positive, got {sigma_v}.")
+        if not np.isfinite(lod) or lod < 0:
+            raise ValueError(f"lod must be finite and non-negative, got {lod}.")
         self.beta = beta
         self.sigma_v = sigma_v
+        self.lod = float(lod)
+
+    def _lod(self, params: dict | None = None) -> float:
+        """Limit of detection, overridable per call via params."""
+        if params and "volume_lod" in params:
+            return float(params["volume_lod"])
+        return self.lod
 
     def _get_viable(self, latent_state: np.ndarray) -> float:
         """Extract viable cells from state vector."""
         return self._project("viable", latent_state)
 
+    def _sigma(self, params: dict | None = None) -> float:
+        """Log-scale measurement SD (inference key ``sigma_v``)."""
+        sigma = self.sigma_v
+        if params and "sigma_v" in params:
+            sigma = float(params["sigma_v"])
+        if not np.isfinite(sigma) or sigma <= 0:
+            raise ValueError(f"sigma_v must be positive, got {sigma}.")
+        return sigma
+
     def _expected_volume(self, latent_state: np.ndarray) -> float:
-        """Expected tumor volume (mm^3)."""
+        """Expected tumor volume (mm^3); median of the lognormal observation."""
         return self.beta * self._get_viable(latent_state)
 
     def log_likelihood(
@@ -76,21 +102,38 @@ class TumorVolumeObservation(TopologyAwareObservation, ObservationModel):
         An LNA process variance for the viable population is folded into the
         log-scale variance via the delta method, as for BLI, so the
         mechanistic variance informs this modality too.
+
+        Readings at or below ``lod`` are treated as **left-censored**, not as
+        exact zeros: the contribution is ``log P(Y <= lod)``. A pre-palpable
+        tumour is normal in an efficacy study, and a lognormal density at zero
+        is undefined -- this used to raise and abort the entire fit at the
+        first such point.
         """
         mu_v = self._expected_volume(latent_state)
-        sigma = self.sigma_v
-        if params and "sigma_v" in params:
-            sigma = float(params["sigma_v"])
-        if not np.isfinite(sigma) or sigma <= 0:
-            raise ValueError(f"sigma_v must be positive, got {sigma}.")
-
-        sigma = self._with_process_variance(sigma, latent_state, process_variance)
+        sigma = self._with_process_variance(
+            self._sigma(params), latent_state, process_variance
+        )
 
         obs_val = float(observed)
-        if not np.isfinite(obs_val) or obs_val <= 0:
+        if not np.isfinite(obs_val):
             raise ValueError(
-                f"Tumor volume observations must be finite and strictly "
-                f"positive under a lognormal model, got {observed!r}."
+                f"Tumor volume observations must be finite, got {observed!r}. "
+                "Use NaN for a missing measurement so it is masked out."
+            )
+        lod = self._lod(params)
+        if lod > 0 and obs_val <= lod:
+            return float(stats.lognorm.logcdf(lod, s=sigma, scale=mu_v))
+        if obs_val <= 0:
+            # P(Y <= 0) is exactly 0 under a lognormal, so censoring at zero
+            # would contribute -inf and kill the fit just as surely as raising.
+            # A recorded zero means "below what the calipers resolve", which is
+            # a positive number the user has to supply.
+            raise ValueError(
+                f"Tumor volume observation {observed!r} is not positive, and "
+                "no limit of detection is set (lod=0), so it cannot be scored: "
+                "a lognormal puts zero probability at or below 0. Pass "
+                "lod=<smallest measurable volume> to treat such readings as "
+                "left-censored, or NaN to mark the point missing."
             )
         return float(stats.lognorm.logpdf(obs_val, s=sigma, scale=mu_v))
 
@@ -99,10 +142,19 @@ class TumorVolumeObservation(TopologyAwareObservation, ObservationModel):
         latent_state: np.ndarray,
         rng: np.random.Generator,
         params: dict | None = None,
+        process_variance: float | None = None,
     ) -> float:
-        """Sample a tumor volume measurement."""
+        """Sample a tumor volume (lognormal; optional process variance)."""
         mu_v = self._expected_volume(latent_state)
-        return float(rng.lognormal(np.log(mu_v), self.sigma_v))
+        sigma = self._with_process_variance(
+            self._sigma(params), latent_state, process_variance
+        )
+        draw = float(rng.lognormal(np.log(mu_v), sigma))
+        # Censor at the detection limit so simulated data has the same
+        # shape as real data, and so posterior predictive checks compare
+        # like with like against the censored likelihood.
+        lod = self._lod(params)
+        return 0.0 if lod > 0 and draw <= lod else draw
 
     def expected_value(self, latent_state: np.ndarray) -> float:
         return self._expected_volume(latent_state)
@@ -130,12 +182,7 @@ class TumorVolumeObservation(TopologyAwareObservation, ObservationModel):
         if not np.isfinite(n_viable) or n_viable <= 0:
             return None
 
-        sigma = self.sigma_v
-        if params and "sigma_v" in params:
-            sigma = float(params["sigma_v"])
-        if not np.isfinite(sigma) or sigma <= 0:
-            raise ValueError(f"sigma_v must be positive, got {sigma}.")
-
+        sigma = self._sigma(params)
         return EKFUpdate(
             z=float(np.log(obs_val)),
             z_pred=float(np.log(self.beta * n_viable)),
@@ -145,4 +192,6 @@ class TumorVolumeObservation(TopologyAwareObservation, ObservationModel):
         )
 
     def param_names(self) -> list[str]:
+        # beta is a fixed calibration; sigma_v is the free noise key used by
+        # ModelLikelihood / OBSERVATION_PARAM_NAMES.
         return ["beta", "sigma_v"]

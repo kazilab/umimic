@@ -41,6 +41,7 @@ import logging
 from collections import defaultdict
 
 import numpy as np
+from scipy.special import logsumexp
 
 from umimic.data.schemas import TimeSeriesData
 from umimic.dynamics.moment_equations import MomentODE
@@ -72,11 +73,19 @@ DEFAULT_PARAM_NAMES = [
     "overdispersion",  # CellCountObservation.overdispersion
 ]
 
-# Parameter set that admits both mechanisms, so cytostatic and cytotoxic
-# action are separately identifiable. This requires mode="moment": the mean
-# alone confounds the two (both reduce net growth), and it is the LNA process
-# variance -- which scales with b + d while the mean scales with b - d -- that
-# breaks the degeneracy. Fitting this set in "ode" mode is under-identified.
+# Parameter set that admits both mechanisms. The mean alone confounds them
+# (both reduce net growth); the LNA process variance scales with b + d while
+# the mean scales with b - d, so in principle the variance breaks the
+# degeneracy and this set requires mode="moment".
+#
+# In practice that route is usually underpowered, and this set should not be
+# read as "cytostatic and cytotoxic are separately identifiable". At the
+# package defaults (phi=10, mu~4000) the process variance is ~1.5% of the
+# total observation variance, a doubling of turnover is worth ~1 nat across a
+# whole dataset, and measured mechanism discrimination on mean-matched
+# synthetic data is at chance (5/11 across seeds and restarts). Check the
+# variance share for your own design before trusting a split.
+# See umimic/inference/SCIENTIFIC_ASSUMPTIONS.md section 2a.
 MECHANISM_PARAM_NAMES = [
     "b0",
     "d0_P",
@@ -159,6 +168,10 @@ OBSERVATION_PARAM_NAMES = frozenset(
         "sigma_log_bli",
         "sigma_v",
         "biomarker_precision",
+        # Between-replicate (extrinsic) spread: see ModelLikelihood's
+        # `sigma_extrinsic` handling. Distinct from `overdispersion`, which is
+        # independent across time points within a replicate.
+        "sigma_extrinsic",
     }
 )
 
@@ -195,6 +208,25 @@ RATE_PARAM_NAMES = frozenset(
 
 #: Every name any backend knows how to use.
 KNOWN_PARAM_NAMES = RATE_PARAM_NAMES | OBSERVATION_PARAM_NAMES
+
+def _scalarize_params(obs_params: dict, position: int) -> dict:
+    """Index array-valued observation parameters down to one time point.
+
+    ``_modality_params`` may attach per-time-point arrays (paired tumour
+    volumes for BLI attenuation) aligned to a modality's masked points. The
+    point-wise fused path needs the scalar at one position.
+    """
+    if position < 0:
+        return dict(obs_params)
+    out = {}
+    for key, value in obs_params.items():
+        arr = np.asarray(value)
+        if arr.ndim >= 1 and position < arr.shape[0]:
+            out[key] = float(arr[position])
+        else:
+            out[key] = value
+    return out
+
 
 # Which observable each modality measures, for process-variance projection.
 MODALITY_OBSERVABLE = {
@@ -419,6 +451,7 @@ class ModelLikelihood:
         condition_on_first: bool = True,
         anchor_modality: str = "cell_counts",
         initial_fractions=None,
+        n_quadrature: int = 9,
     ):
         """
         Args:
@@ -446,6 +479,13 @@ class ModelLikelihood:
         self.condition_on_first = condition_on_first
         self.anchor_modality = anchor_modality
         self.initial_fractions = initial_fractions
+        # Gauss-Hermite nodes for integrating out `sigma_extrinsic`. Only
+        # used when that parameter is present and positive.
+        if n_quadrature < 3 or n_quadrature % 2 == 0:
+            raise ValueError(
+                f"n_quadrature must be an odd integer >= 3, got {n_quadrature}."
+            )
+        self.n_quadrature = n_quadrature
         self._n_evals = 0
 
         if observation_model is None:
@@ -513,12 +553,22 @@ class ModelLikelihood:
         is invisible in a fit curve, so it is an error rather than a warning.
         ParticleMCMC applies the same check; keep them aligned.
         """
-        unknown = [n for n in self.param_names if n not in KNOWN_PARAM_NAMES]
+        # Observation models may declare their own parameter keys, so that two
+        # channels of the same kind (viable counts and dead counts) can carry
+        # separate noise parameters instead of competing for one. Collect them
+        # from the models actually in use rather than hard-coding the names.
+        known = set(KNOWN_PARAM_NAMES)
+        for model in self._modality_models.values():
+            key = getattr(model, "overdispersion_key", None)
+            if key:
+                known.add(key)
+
+        unknown = [n for n in self.param_names if n not in known]
         if unknown:
             raise ValueError(
                 f"Parameter(s) {unknown} are not read by the forward model or "
                 "any observation model, so estimating them would return the "
-                f"prior. Known parameters: {sorted(KNOWN_PARAM_NAMES)}."
+                f"prior. Known parameters: {sorted(known)}."
             )
 
     def _missing_state_params(self, names: set[str]) -> list[str]:
@@ -675,7 +725,53 @@ class ModelLikelihood:
         means: np.ndarray,
         covs: np.ndarray | None,
     ) -> float:
-        """Log-likelihood for one replicate, summed over all its modalities."""
+        """Log-likelihood for one replicate, marginal over its random effect.
+
+        `sigma_extrinsic` is the between-replicate spread: wells differ in
+        seeding density and handling, so one well sits systematically high or
+        low across *all* its time points. `overdispersion` cannot represent
+        that -- it is independent between time points, so with enough of them
+        it averages away, while a well effect never does. Left unmodelled the
+        spread has nowhere to go but the mechanistic rates: on BESTDR, where
+        seeding differs ~20x between wells, moment-mode fits inflate b0 and
+        d0_P several-fold trying to explain it as demographic noise.
+
+        The effect enters as a multiplicative factor on the trajectory. That
+        is exact rather than convenient: for a density-independent model the
+        dynamics are linear, so scaling the initial population scales the mean
+        *and* the LNA covariance by the same factor. It is centred
+        (`- sigma^2/2`) so switching it on does not shift the mean, and
+        integrated out by Gauss-Hermite quadrature -- the marginal likelihood
+        of the replicate, not a plug-in estimate of its effect.
+        """
+        sigma = float(params.get("sigma_extrinsic", 0.0) or 0.0)
+        if not np.isfinite(sigma) or sigma <= 0.0:
+            return self._evaluate_replicate_core(data, params, t_sol, means, covs)
+
+        nodes, weights = np.polynomial.hermite.hermgauss(self.n_quadrature)
+        # u ~ N(0, sigma^2)  ==>  int f(u) p(u) du = (1/sqrt(pi)) sum w_k f(sqrt(2) sigma x_k)
+        log_terms = []
+        for x_k, w_k in zip(nodes, weights):
+            log_scale = np.sqrt(2.0) * sigma * x_k - 0.5 * sigma**2
+            ll_k = self._evaluate_replicate_core(
+                data, params, t_sol, means, covs, log_scale=log_scale
+            )
+            if np.isfinite(ll_k):
+                log_terms.append(np.log(w_k) + ll_k)
+        if not log_terms:
+            return -np.inf
+        return float(logsumexp(np.asarray(log_terms)) - 0.5 * np.log(np.pi))
+
+    def _evaluate_replicate_core(
+        self,
+        data: TimeSeriesData,
+        params: dict[str, float],
+        t_sol: np.ndarray,
+        means: np.ndarray,
+        covs: np.ndarray | None,
+        log_scale: float = 0.0,
+    ) -> float:
+        """Log-likelihood for one replicate at a fixed random-effect value."""
         # Map this replicate's times onto the shared union grid. Because the
         # grid is the union of all replicate times, every time is present; we
         # locate it exactly rather than snapping to a neighbour.
@@ -690,9 +786,37 @@ class ModelLikelihood:
             )
 
         latent = np.maximum(means[idx], 0.0)
+        replicate_covs = covs
+        if log_scale != 0.0:
+            scale = float(np.exp(log_scale))
+            latent = latent * scale
+            # Linear dynamics: both the mean and the LNA covariance are
+            # proportional to the initial population, so the covariance scales
+            # by `scale`, not `scale**2`.
+            if replicate_covs is not None:
+                replicate_covs = replicate_covs * scale
+        covs = replicate_covs
 
         total_ll = 0.0
+
+        # Modalities that share the latent population must be fused, not
+        # multiplied: BLI and volume are both deterministic functions of the
+        # same N_viable, so folding the LNA process variance into each marginal
+        # separately counts one fluctuation twice and narrows the posterior.
+        fused_modalities = self._fusable_modalities(data)
+        if covs is not None and len(fused_modalities) >= 2:
+            fused_ll, fused_handled = self._fused_replicate_ll(
+                data, params, idx, latent, covs, fused_modalities
+            )
+            if not np.isfinite(fused_ll):
+                return -np.inf
+            total_ll += fused_ll
+        else:
+            fused_handled = frozenset()
+
         for modality in self._active_modalities:
+            if modality in fused_handled:
+                continue
             if not data.has_modality(modality):
                 continue
 
@@ -723,6 +847,104 @@ class ModelLikelihood:
             total_ll += ll
 
         return total_ll
+
+    def _fusable_modalities(self, data: TimeSeriesData) -> list[str]:
+        """Active modalities on this replicate that can share one joint normal.
+
+        A modality qualifies when it measures a projection of the latent state
+        (so the LNA covariance reaches it) and supplies a Gaussian
+        linearization. Biomarker fractions have no linearization and are scored
+        exactly, on their own.
+        """
+        out = []
+        for modality in self._active_modalities:
+            if not data.has_modality(modality):
+                continue
+            if MODALITY_OBSERVABLE.get(modality) is None:
+                continue
+            model = self._modality_models[modality]
+            if type(model).linearize is ObservationModel.linearize:
+                continue
+            out.append(modality)
+        return out
+
+    def _fused_replicate_ll(
+        self,
+        data: TimeSeriesData,
+        params: dict[str, float],
+        idx: np.ndarray,
+        latent: np.ndarray,
+        covs: np.ndarray,
+        modalities: list[str],
+    ) -> tuple[float, frozenset[str]]:
+        """Score latent-sharing modalities jointly, point by point.
+
+        At a time point where two or more of them are observed, one
+        multivariate normal carries the correlation induced by the shared
+        population. Where only one is observed there is nothing to correlate,
+        so the exact per-modality likelihood is used instead -- it keeps the
+        true observation law (negative binomial, lognormal) rather than the
+        Gaussian approximation the fused path necessarily uses.
+
+        Returns the summed log-likelihood and the set of modalities it covers,
+        which the caller must then skip.
+        """
+        masks = {m: self.scored_mask(data, m) for m in modalities}
+        obs_params = {
+            m: self._modality_params(m, params, data, idx, masks[m])
+            for m in modalities
+        }
+        # Position of each scored point within that modality's masked arrays,
+        # so array-valued parameters (per-time-point tumour volumes) can be
+        # indexed back to a scalar for the point-wise calls below.
+        positions = {m: np.cumsum(masks[m]) - 1 for m in modalities}
+
+        fusion = MultimodalObservation(
+            {m: self._modality_models[m] for m in modalities}
+        )
+
+        total = 0.0
+        for j in range(len(data.times)):
+            present = {}
+            point_params = {}
+            for m in modalities:
+                if not masks[m][j]:
+                    continue
+                value = data.observations[m][j]
+                if not np.isfinite(value):
+                    continue
+                present[m] = float(value)
+                point_params[m] = _scalarize_params(
+                    obs_params[m], int(positions[m][j])
+                )
+
+            if not present:
+                continue
+
+            state = latent[j]
+            if len(present) >= 2:
+                ll = fusion.joint_log_likelihood(
+                    present, state, covs[idx[j]], point_params
+                )
+                if ll is not None:
+                    if not np.isfinite(ll):
+                        return -np.inf, frozenset(modalities)
+                    total += ll
+                    continue
+                # Fusion declined (degenerate covariance, or fewer than two
+                # modalities could linearize); fall through and score each
+                # exactly.
+
+            for m, value in present.items():
+                model = self._modality_models[m]
+                observable = MODALITY_OBSERVABLE[m]
+                pv = float(model.project_variance(observable, covs[idx[j]]))
+                ll = model.log_likelihood(value, state, point_params[m], pv)
+                if not np.isfinite(ll):
+                    return -np.inf, frozenset(modalities)
+                total += ll
+
+        return total, frozenset(modalities)
 
     def _modality_params(
         self,

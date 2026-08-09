@@ -104,6 +104,23 @@ class BiomarkerObservation(TopologyAwareObservation, ObservationModel):
             "a fixed fake observation rather than a customisable one."
         )
 
+    def _kappa(self, params: dict | None = None) -> float:
+        """Beta precision; inference key is ``biomarker_precision``.
+
+        Accepts the legacy alias ``precision`` for backwards compatibility.
+        """
+        kappa = self.precision
+        if params:
+            if "biomarker_precision" in params:
+                kappa = float(params["biomarker_precision"])
+            elif "precision" in params:
+                kappa = float(params["precision"])
+        if not np.isfinite(kappa) or kappa <= 0:
+            raise ValueError(
+                f"biomarker_precision must be positive, got {kappa}."
+            )
+        return kappa
+
     def log_likelihood(
         self,
         observed: float | np.ndarray,
@@ -116,18 +133,17 @@ class BiomarkerObservation(TopologyAwareObservation, ObservationModel):
         An extinct population contributes nothing: there are no cells to
         stain, so the fraction is undefined and the term is dropped rather
         than evaluated against a fabricated 0.5.
+
+        ``process_variance`` is accepted for API parity but not used: a
+        fraction's noise model is not the viable-count LNA variance, and a
+        naive delta-method map would be misleading without a full fraction
+        Jacobian.
         """
         f = self._get_fraction(latent_state)
         if not np.isfinite(f):
             return 0.0
 
-        kappa = self.precision
-        if params and "biomarker_precision" in params:
-            kappa = float(params["biomarker_precision"])
-        if not np.isfinite(kappa) or kappa <= 0:
-            raise ValueError(
-                f"biomarker_precision must be positive, got {kappa}."
-            )
+        kappa = self._kappa(params)
 
         obs_val = float(observed)
         if not np.isfinite(obs_val) or not 0.0 <= obs_val <= 1.0:
@@ -145,19 +161,19 @@ class BiomarkerObservation(TopologyAwareObservation, ObservationModel):
         latent_state: np.ndarray,
         rng: np.random.Generator,
         params: dict | None = None,
+        process_variance: float | None = None,
     ) -> float:
         """Sample a biomarker observation. Extinct populations give NaN."""
         f = self._get_fraction(latent_state)
         if not np.isfinite(f):
             return float("nan")
         f = np.clip(f, 1e-4, 1 - 1e-4)
-        kappa = self.precision
-        if params and "biomarker_precision" in params:
-            kappa = float(params["biomarker_precision"])
+        kappa = self._kappa(params)
         return float(rng.beta(kappa * f, kappa * (1 - f)))
 
     def expected_value(self, latent_state: np.ndarray) -> float:
         return self._get_fraction(latent_state)
 
     def param_names(self) -> list[str]:
-        return ["precision"]
+        # Matches ModelLikelihood / OBSERVATION_PARAM_NAMES.
+        return ["biomarker_precision"]
