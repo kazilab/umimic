@@ -1,0 +1,303 @@
+{
+  "version": 2,
+  "description": "Catalog of public datasets supported by umimic.data.public_datasets. Observation tables live as compressed long-form products (*_umimic.csv.xz); this file holds metadata only. Each entry records a DOI (where one exists), the preferred citation, and licence/redistribution notes for the derived product.",
+  "datasets": {
+    "tshs_tumor": {
+      "id": "tshs_tumor",
+      "title": "TSHS xenograft tumor growth",
+      "context": "in_vivo",
+      "modalities": [
+        "volume"
+      ],
+      "source_url": "https://www.causeweb.org/tshs/tumor-growth/",
+      "citation": "Daskalakis C. Tumor Growth Dataset. TSHS Resources Portal, 2016. Available at https://www.causeweb.org/tshs/tumor-growth/.",
+      "license_notes": "Permission granted for research use with citation of the source above. No additional conditions. No DOI is issued for this teaching dataset.",
+      "product": "tshs_tumor/tshs_tumor_umimic.csv.xz",
+      "source_workbook": "tshs_tumor/tumorgrowth.xlsx",
+      "n_subjects": 37,
+      "treatment_arms": [
+        "CONTROL",
+        "DRUG",
+        "RADIATION",
+        "DRUG+RADIATION"
+      ],
+      "time_unit": "hours (day * 24 from irregular measurement schedule)",
+      "value_unit": "mm^3 (tumor volume from caliper measurements)",
+      "data_quality": {
+        "summary": "Based on a real experiment; some measurements were tweaked for teaching. Timing is irregular (typically every 2–3 days). Caliper volumes are error-prone.",
+        "quality_flag_column": "quality_flag",
+        "flags": {
+          "ok": "No owner highlight; retained.",
+          "nonmonotonic_red": "Red font in Excel: modest non-monotonic wiggle; normal measurement error — retained.",
+          "suspicious_green": "Green fill in Excel: larger fluctuation, possibly real late shrinkage — retained by default.",
+          "exclude_clear_error": "Orange fill in Excel: clearly wrong — removed from the distributed product (see EXCLUDED_VALUES.csv)."
+        },
+        "excluded_values": [
+          {
+            "mouse_id": "202",
+            "treatment": "DRUG",
+            "day": 3.0,
+            "tumor_volume": 623.7,
+            "reason": "Orange highlight; clearly wrong given preceding/following sizes."
+          },
+          {
+            "mouse_id": "302",
+            "treatment": "RADIATION",
+            "day": 26.0,
+            "tumor_volume": 734.4,
+            "reason": "Orange highlight; clearly wrong given preceding/following sizes."
+          }
+        ]
+      },
+      "columns": {
+        "hours": {
+          "role": "time",
+          "unit": "h"
+        },
+        "day": {
+          "role": "time",
+          "unit": "d"
+        },
+        "tumor_volume": {
+          "role": "observation",
+          "modality": "volume",
+          "unit": "mm^3"
+        },
+        "concentration": {
+          "role": "covariate",
+          "note": "Always 0; treatment is categorical."
+        },
+        "group_id": {
+          "role": "series_id"
+        },
+        "treatment": {
+          "role": "group"
+        },
+        "mouse_id": {
+          "role": "subject"
+        },
+        "quality_flag": {
+          "role": "qc"
+        }
+      },
+      "doi": null
+    },
+    "phenopop": {
+      "id": "phenopop",
+      "title": "PhenoPop Ba/F3 live-cell imaging under imatinib",
+      "context": "in_vitro",
+      "modalities": [
+        "cell_counts"
+      ],
+      "source_url": "https://github.com/chenyuwu233/PhenoPop_stochastic",
+      "citation": "Wu C, Gunnarsson E, Myklebust EM, Kohn-Luque A, et al. Using birth-death processes to infer tumor subpopulation structure from live-cell imaging drug screening data. PLOS Computational Biology 20(3):e1011888, 2024. doi:10.1371/journal.pcbi.1011888",
+      "product": "phenopop/phenopop_umimic.csv.xz",
+      "raw_cache": "phenopop/phenopop_repo (download only; not shipped)",
+      "columns": {
+        "hours": {
+          "role": "time",
+          "unit": "h"
+        },
+        "viable_count": {
+          "role": "observation",
+          "modality": "cell_counts"
+        },
+        "concentration": {
+          "role": "dose"
+        },
+        "replicate_id": {
+          "role": "series_id"
+        },
+        "population": {
+          "role": "group"
+        }
+      },
+      "doi": "10.1371/journal.pcbi.1011888",
+      "license_notes": "PLOS Computational Biology is open access under CC BY 4.0. Source data and MATLAB code at https://github.com/chenyuwu233/PhenoPop_stochastic. Redistribution with attribution is permitted.",
+      "code_url": "https://github.com/chenyuwu233/PhenoPop_stochastic",
+      "products": {
+        "timeseries": "phenopop/phenopop_umimic.csv.xz",
+        "reference_fits": "phenopop/phenopop_reference_fits_umimic.csv",
+        "reference_intervals": "phenopop/phenopop_reference_intervals_umimic.csv"
+      },
+      "reference_notes": "The authors' own published fits are shipped alongside the data: 72 fit rows and 81 bootstrap intervals covering the four mixtures (BF_11/12/21/41) and the monoclonal controls, for three models -- 'sto' (stochastic birth-death, the paper's contribution), 'dyn' (deterministic mean) and 'hl' (the original PhenoPop Hill deconvolution). This makes a head-to-head possible without re-running their MATLAB. Only element 0 of the birth-death parameter vectors is interpreted (the mixture proportion p), confirmed against the published ci_*_p intervals; the rest is preserved verbatim as JSON. Caution: estimated proportions do not match nominal seeding ratios (BF_11 is nominally 1:1, estimated ~0.30) -- that is the authors' published result, so nominal_ratio records the intended design, not ground truth."
+    },
+    "hafner_gr": {
+      "id": "hafner_gr",
+      "title": "Hafner/Niepel GR metrics (breast cancer lines × drugs)",
+      "context": "in_vitro",
+      "modalities": [
+        "cell_counts"
+      ],
+      "source_url": "https://datadryad.org/dataset/doi:10.5061/dryad.03n60",
+      "citation": "Hafner M, Niepel M, Subramanian K, Sorger PK. Quantification of sensitivity and resistance of breast cancer cell lines to anti-cancer drugs using GR metrics. Scientific Data 4:170166, 2017. doi:10.1038/sdata.2017.166. Data: Dryad doi:10.5061/dryad.03n60",
+      "product": "hafner_gr/hafner_gr_umimic.csv.xz",
+      "raw_cache": "hafner_gr/dryad_data, hafner_gr/nmeth_supp* (download only; not shipped)",
+      "doi": "10.1038/sdata.2017.166",
+      "data_doi": "10.5061/dryad.03n60",
+      "license_notes": "Scientific Data article CC BY 4.0; Dryad deposit released under CC0. Redistribution permitted with attribution."
+    },
+    "nci60": {
+      "id": "nci60",
+      "title": "NCI-60 DTP growth inhibition (endpoint screening)",
+      "context": "in_vitro",
+      "modalities": [
+        "cell_counts",
+        "growth_inhibition_pct",
+        "percent_of_control"
+      ],
+      "source_url": "https://dtp.cancer.gov/databases_tools/bulk_data.htm",
+      "citation": "NCI Developmental Therapeutics Program (DTP). NCI-60 Growth Inhibition (GI) screening data. https://dtp.cancer.gov/databases_tools/bulk_data.htm",
+      "product": "nci60/nci60_umimic.csv.xz",
+      "raw_cache": "nci60/DOSERESP.csv (download only; multi-GB; not shipped)",
+      "loader": "load_nci60",
+      "notes": "Endpoint GI%/PTC screening (~2.5M rows). Prefer filters nsc= and/or cell_line=. Default representation reconstructs a 2-point count series from percent_of_control with nominal N0=10000 and assay_hours=48; use representation=endpoint_metrics for honest single-time GI%/PTC storage.",
+      "columns": {
+        "experiment_id": {
+          "role": "batch"
+        },
+        "NSC": {
+          "role": "compound_id"
+        },
+        "cell_line": {
+          "role": "cell_line"
+        },
+        "panel": {
+          "role": "tissue_panel"
+        },
+        "concentration_log10M": {
+          "role": "dose",
+          "unit": "log10(M)"
+        },
+        "concentration": {
+          "role": "dose",
+          "unit": "µM"
+        },
+        "growth_inhibition_pct": {
+          "role": "endpoint",
+          "unit": "%"
+        },
+        "percent_of_control": {
+          "role": "endpoint",
+          "unit": "% of untreated"
+        }
+      },
+      "common_nsc": {
+        "cisplatin": "119875",
+        "doxorubicin": "123127",
+        "paclitaxel": "125973"
+      },
+      "license_notes": "US Government public-domain data produced by the NCI DTP. Free to use and redistribute; citation of DTP requested."
+    },
+    "bestdr": {
+      "id": "bestdr",
+      "title": "BESTDR HCT116 + cisplatin live-cell imaging counts",
+      "context": "in_vitro",
+      "modalities": [
+        "cell_counts",
+        "dead_count"
+      ],
+      "source_url": "https://github.com/olliemcdonald/bestdr",
+      "citation": "McDonald TO, Bruno S, Roney JP, Zervantonakis IK, et al. BESTDR Enables Bayesian Quantification of Mechanism-Specific Drug Responses. Cancer Research, 2025. doi:10.1158/0008-5472.CAN-25-1181",
+      "product": "bestdr/bestdr_umimic.csv.xz",
+      "loader": "load_bestdr",
+      "notes": "Compact extract: HCT116 cisplatin multi-well multi-FOV live/dead counts every 4 h (replicates + dose-response plates). Negative live counts clipped to 0 and flagged. Full multi-line BESTDR R data not vendored.",
+      "columns": {
+        "hours": {
+          "role": "time",
+          "unit": "h"
+        },
+        "viable_count": {
+          "role": "observation",
+          "modality": "cell_counts"
+        },
+        "dead_count": {
+          "role": "observation",
+          "modality": "dead_count"
+        },
+        "concentration": {
+          "role": "dose",
+          "unit": "µM"
+        },
+        "replicate_id": {
+          "role": "series_id"
+        },
+        "well": {
+          "role": "well"
+        },
+        "img": {
+          "role": "fov_index"
+        }
+      },
+      "doi": "10.1158/0008-5472.CAN-25-1181",
+      "license_notes": "Article open access under CC BY-NC-ND via Europe PMC. Derived product redistributed for non-commercial research use with attribution. Preprint: bioRxiv 2025.02.05.636681.",
+      "preprint_doi": "10.1101/2025.02.05.636681"
+    },
+    "whiting2025_barcode": {
+      "id": "whiting2025_barcode",
+      "title": "Whiting 2025 bulk barcode population sizes (tiny extract)",
+      "context": "in_vitro",
+      "modalities": [
+        "cell_counts"
+      ],
+      "source_url": "https://doi.org/10.1038/s41467-025-59479-x",
+      "citation": "Whiting FJH, Mossner M, Gabbutt C, Kimberley C, et al. Quantitative measurement of phenotype dynamics during cancer drug resistance evolution using genetic barcoding. Nature Communications 16, 2025. doi:10.1038/s41467-025-59479-7",
+      "product": "whiting2025_barcode/whiting2025_barcode_population_umimic.csv.xz",
+      "loader": "load_whiting2025_barcode",
+      "notes": "Bulk population size vs time only (HCTbc / SW6bc, 4 replicates each). Not imaging. Not scRNA. Not full barcode matrices. Time in hours = day*24. Concentration=0 (pulsed treatment schedule).",
+      "columns": {
+        "hours": {
+          "role": "time",
+          "unit": "h"
+        },
+        "day": {
+          "role": "time",
+          "unit": "d"
+        },
+        "population_size": {
+          "role": "observation",
+          "modality": "cell_counts"
+        },
+        "group_id": {
+          "role": "series_id"
+        },
+        "cell_line": {
+          "role": "cell_line"
+        },
+        "replicate": {
+          "role": "replicate"
+        }
+      },
+      "doi": "10.1038/s41467-025-59479-7",
+      "license_notes": "Nature Communications is open access under CC BY 4.0. Supplementary Data and Source Data files are redistributable with attribution.",
+      "products": {
+        "population": "whiting2025_barcode/whiting2025_barcode_population_umimic.csv.xz",
+        "lineage": "whiting2025_barcode/whiting2025_barcode_lineage_umimic.csv.xz"
+      },
+      "lineage_notes": "Long-form per-barcode abundances from Supplementary Data 2 (HCTbc_Barcode_Data, SW6bc_Barcode_Data): 5,619,208 rows covering 13,962 HCT116 and 688,439 SW620 barcodes across 4 sequencing timepoints x 2 plates. Zero counts are retained deliberately -- an absent barcode is an observed extinction, not a missing measurement. Library sizes differ between samples, so compare relative frequencies rather than raw counts. Column sums were verified against the source workbook."
+    },
+    "csc_dip": {
+      "id": "csc_dip",
+      "title": "Cancer stem cells / drug-induced plasticity (Wu et al. 2025)",
+      "context": "in_vitro",
+      "modalities": [
+        "cell_counts"
+      ],
+      "doi": "10.1038/s41540-025-00560-8",
+      "source_url": "https://github.com/chenyuwu233/Cancer-Stem-Cells-Drug-induced-Plasticity",
+      "citation": "Wu C, Gunnarsson E, Foo J, Leder K. A statistical framework for detecting therapy-induced resistance from drug screens. npj Systems Biology and Applications, 2025. doi:10.1038/s41540-025-00560-8",
+      "license_notes": "Article open access under CC BY-NC-ND via Europe PMC. No derived product is shipped because the underlying measurements are not available -- see availability below.",
+      "product": null,
+      "availability": "results_only",
+      "availability_notes": "The public code repository contains the analysis scripts and the authors' stored results, but NOT the measurements they were run on. Every data input is loaded from a file absent from the repository, so no product can be built from it. Missing inputs: 'COLO858 data.xlsx', 'CPX paper (Figures 1E, 1F, 2A and 2B data).xlsx', 'CPX paper (Figures 1E and 2B data).xlsx' (readcell sources); DATA_COLO858_60h.mat, Forward_D24_v.mat, T12_2T_v.mat, rate24.mat (load sources). Only the Conc and Time vectors are inline in the scripts. Their published AIC/AICc values ARE extracted and shipped (16 rows: AGS gastric with CPX-O, its time-delay variant, and COLO858 with vemurafenib), so their model-selection conclusions remain comparable. Obtain the workbooks from the authors or the npj supplementary material before attempting a comparison.",
+      "experiments": [
+        "AGS gastric line with CPX-O (Conc 0-16, Time 0/12/36 h, 2 replicates)",
+        "COLO858 melanoma line with vemurafenib (60 h)"
+      ],
+      "results_available": "Their published AIC values ship in the repository (In_vitro_AGS_AIC.mat, In_vitro_COLO858_60h_AIC.mat), so their conclusions can be compared even where their fit cannot be rerun.",
+      "products": {
+        "reference_aic": "csc_dip/csc_dip_reference_aic_umimic.csv"
+      }
+    }
+  }
+}

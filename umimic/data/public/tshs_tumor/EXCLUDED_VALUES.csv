@@ -1,0 +1,3 @@
+hours,day,tumor_volume,concentration,group_id,treatment,mouse_id,quality_flag,reason
+72.0,3.0,623.7,0.0,mouse_202,DRUG,202,exclude_clear_error,Orange highlight in source Excel: clearly wrong per data owner (Daskalakis 2016 correspondence)
+624.0,26.0,734.4,0.0,mouse_302,RADIATION,302,exclude_clear_error,Orange highlight in source Excel: clearly wrong per data owner (Daskalakis 2016 correspondence)

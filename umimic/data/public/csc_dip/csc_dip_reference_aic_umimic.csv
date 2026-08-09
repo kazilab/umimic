@@ -1,0 +1,17 @@
+experiment,context,model,criterion,value,source_file
+AGS_gastric_CPX-O,in_vitro,Model_I,AIC,653.4865660973778,In_vitro_AGS_AIC.mat
+AGS_gastric_CPX-O,in_vitro,Model_Ia,AIC,677.9985031127118,In_vitro_AGS_AIC.mat
+AGS_gastric_CPX-O,in_vitro,DIP,AIC,653.4865660973778,In_vitro_AGS_AIC.mat
+AGS_gastric_CPX-O,in_vitro,DIP,AICc,661.0963221949388,In_vitro_AGS_AIC.mat
+AGS_gastric_CPX-O,in_vitro,nDIP,AIC,677.9985031127118,In_vitro_AGS_AIC.mat
+AGS_gastric_CPX-O,in_vitro,nDIP,AICc,679.785737155265,In_vitro_AGS_AIC.mat
+AGS_gastric_CPX-O_time_delay,in_vitro,Model_II,AIC,543.760704755209,In_vitro_AGS_Time_Delay_AIC.mat
+AGS_gastric_CPX-O_time_delay,in_vitro,Model_IIa,AIC,576.5119636427171,In_vitro_AGS_Time_Delay_AIC.mat
+AGS_gastric_CPX-O_time_delay,in_vitro,DIP_TD2,AIC,543.760704755209,In_vitro_AGS_Time_Delay_AIC.mat
+AGS_gastric_CPX-O_time_delay,in_vitro,DIP_TD2,AICc,554.5299355244397,In_vitro_AGS_Time_Delay_AIC.mat
+AGS_gastric_CPX-O_time_delay,in_vitro,nDIP_TD2,AIC,576.5119636427171,In_vitro_AGS_Time_Delay_AIC.mat
+AGS_gastric_CPX-O_time_delay,in_vitro,nDIP_TD2,AICc,579.7119636427171,In_vitro_AGS_Time_Delay_AIC.mat
+COLO858_vemurafenib_60h,in_vitro,DIP_Asy,AIC,6145.026311235271,In_vitro_COLO858_60h_AIC.mat
+COLO858_vemurafenib_60h,in_vitro,DIP_nAsy,AIC,6182.857205453818,In_vitro_COLO858_60h_AIC.mat
+COLO858_vemurafenib_60h,in_vitro,nDIP_Asy,AIC,6370.387178112858,In_vitro_COLO858_60h_AIC.mat
+COLO858_vemurafenib_60h,in_vitro,nDIP_nAsy,AIC,6442.9541818305515,In_vitro_COLO858_60h_AIC.mat
