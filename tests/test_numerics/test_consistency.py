@@ -224,7 +224,13 @@ def test_fit_reports_unsupported_modes_with_a_pointer_to_the_direct_api():
 
     config = ExperimentConfig()
     exp = Experiment(config)
-    exp.config.inference.mode = "smc"  # bypass validation, as direct use would
+    # Reach fit()'s defensive branch for a mode the schema now refuses. Plain
+    # assignment used to bypass validation; config sections set
+    # validate_assignment=True, so corrupting __dict__ directly is the only way
+    # to construct the invalid state this guard exists to catch. That the
+    # bypass got harder is the point -- the guard is defence in depth behind a
+    # schema that should already have rejected this.
+    exp.config.inference.__dict__["mode"] = "smc"
 
     data = TimeSeriesData.from_counts(np.linspace(0, 24, 5), [100.0] * 5)
     with pytest.raises(ValueError, match="ParticleMCMC"):
@@ -448,12 +454,54 @@ def test_the_quiescent_death_fallback_announces_itself(caplog):
     assert "fixed at 0.5 * d0_P" not in caplog.text
 
 
-def test_exposure_profile_advertises_no_unused_cache():
-    """precompute() filled a cache concentration() never read.
+def test_exposure_profile_cache_agrees_with_the_exact_solve():
+    """precompute() must be a speed-up, never a different answer.
 
-    It promised a speed-up it did not deliver, so it was removed rather than
-    wired to an interpolation whose error the caller could not see.
+    This test previously asserted `precompute` did not exist: the cache it
+    filled was unread, so it promised a speed-up it did not deliver. The cache
+    is now read by concentration() and populated by the pipeline, so the thing
+    worth pinning is that it agrees with the exact PK solve -- including
+    outside the cached span, where clamping to the endpoint concentration used
+    to turn a decaying profile into a constant infusion.
     """
+    import numpy as np
+
+    from umimic.pk.compartment import OneCompartmentPK
+    from umimic.pk.dosing import DosingSchedule
     from umimic.pk.exposure import ExposureProfile
 
-    assert not hasattr(ExposureProfile, "precompute")
+    pk = OneCompartmentPK(vd=10.0, ke=0.1)
+    dosing = DosingSchedule.repeated(100.0, interval=24.0, n_doses=3)
+
+    exact = ExposureProfile.from_pk(pk, dosing)
+    cached = ExposureProfile.from_pk(pk, dosing)
+    grid = np.unique(
+        np.concatenate([np.linspace(0, 72, 289), [24.0, 24.0 + 1e-9, 48.0, 48.0 + 1e-9]])
+    )
+    cached.precompute(grid)
+
+    probes = np.linspace(0.5, 71.5, 60)
+    for t in probes:
+        assert cached(t) == pytest.approx(exact(t), rel=2e-2, abs=1e-9)
+
+    # Past the end of the grid the profile decays; it must not be held flat.
+    assert cached(1000.0) == pytest.approx(exact(1000.0), rel=1e-9, abs=1e-12)
+    assert cached(1000.0) < 1e-30
+
+
+def test_exposure_profile_call_rejects_arrays():
+    """__call__ silently returned C(t[0]) for an array argument.
+
+    Every consumer in dynamics/ holds this as a bare callable, so a vectorized
+    call site would have applied one concentration at every time point with no
+    error raised anywhere.
+    """
+    import numpy as np
+
+    from umimic.pk.exposure import ExposureProfile
+
+    profile = ExposureProfile.constant(5.0)
+    with pytest.raises(TypeError, match="scalar time"):
+        profile(np.array([0.0, 10.0, 20.0]))
+    assert profile(3.0) == 5.0
+    assert np.allclose(profile.concentration(np.array([0.0, 10.0])), [5.0, 5.0])

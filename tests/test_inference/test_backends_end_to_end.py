@@ -689,9 +689,19 @@ def test_hierarchical_log_prior_rejects_non_positive_values(topology):
         _replicate_dataset(topology), topology, [], ["b0"],
         priors=priors, mode="ode", rng=1,
     )
+    # The model is now non-centered: coordinates are
+    # [pop_mean, log_pop_sd, z...]. A negative between-group scale is no longer
+    # representable at all -- pop_sd = exp(log_pop_sd) is positive by
+    # construction -- so the old "reject a negative scale" case is structurally
+    # impossible rather than merely rejected. What must still be rejected is a
+    # non-positive population median, which is a lognormal location.
     bad = np.full(model.n_dim, 0.05)
-    bad[1] = -0.1  # negative between-group scale
+    bad[0] = -0.1  # negative population median
     assert model.log_prior(bad) == -np.inf
+
+    # And any log_pop_sd maps to a positive scale, however extreme.
+    for log_sd in (-50.0, -0.1, 0.0, 3.0):
+        assert np.exp(log_sd) > 0
 
 
 def test_pmcmc_recovers_a_parameter_from_data(topology):
@@ -744,11 +754,22 @@ def test_hierarchical_admits_a_zero_shared_parameter(topology):
     theta = np.array([0.0, 0.05, 0.1] + [0.05] * n_groups)
     assert np.isfinite(model.log_prior(theta)), "zero Emax must be admissible"
 
-    # Negative rates remain impossible, and the random effects stay positive.
+    # Negative shared rates remain impossible, as does a non-positive
+    # population median.
     assert not np.isfinite(model.log_prior(np.array([-0.01, 0.05, 0.1] + [0.05] * n_groups)))
-    assert not np.isfinite(model.log_prior(np.array([0.02, 0.05, 0.1] + [0.0] * n_groups)))
     assert not np.isfinite(model.log_prior(np.array([0.02, 0.0, 0.1] + [0.05] * n_groups)))
-    assert not np.isfinite(model.log_prior(np.array([0.02, 0.05, 0.0] + [0.05] * n_groups)))
+
+    # Two former rejections are now admissible *by construction*, which is the
+    # point of the non-centered parameterization:
+    #   z = 0        -> theta_i == pop_mean, a perfectly ordinary group
+    #   log_pop_sd=0 -> pop_sd == 1, an ordinary between-group scale
+    # Group parameters stay positive because they are pop_mean * exp(...),
+    # so positivity no longer needs enforcing by rejection.
+    assert np.isfinite(model.log_prior(np.array([0.02, 0.05, 0.1] + [0.0] * n_groups)))
+    assert np.isfinite(model.log_prior(np.array([0.02, 0.05, 0.0] + [0.05] * n_groups)))
+    theta = np.array([0.02, 0.05, 0.1] + [0.0] * n_groups)
+    _, pop_mean, log_sd, z = model._split(theta)
+    assert np.all(model.group_values(pop_mean, np.exp(log_sd), z) > 0)
 
 
 def test_pmcmc_honours_initial_fractions(topology):

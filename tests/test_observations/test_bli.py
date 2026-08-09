@@ -60,6 +60,38 @@ class TestBLIObservation:
 
         assert signal_peak >= signal_off
 
+    def test_param_names_use_inference_key(self):
+        """Free noise key matches OBSERVATION_PARAM_NAMES / ModelLikelihood."""
+        assert "sigma_log_bli" in BLIObservation().param_names()
+
+    def test_sample_respects_sigma_override(self, rng):
+        state = np.array([100.0, 0.0])
+        obs = BLIObservation(alpha=1000.0, sigma_log=0.05)
+        tight = [
+            obs.sample(state, rng, {"sigma_log_bli": 0.05}) for _ in range(2000)
+        ]
+        loose = [
+            obs.sample(state, rng, {"sigma_log_bli": 0.8}) for _ in range(2000)
+        ]
+        # Compare CV of log-signal so the comparison is scale-free.
+        assert np.std(np.log(loose)) > np.std(np.log(tight)) * 2
+
+    def test_legacy_sigma_log_alias_still_works(self):
+        obs = BLIObservation(alpha=1000.0, sigma_log=0.3)
+        state = np.array([100.0, 0.0])
+        ll_new = obs.log_likelihood(1e5, state, {"sigma_log_bli": 0.5})
+        ll_old = obs.log_likelihood(1e5, state, {"sigma_log": 0.5})
+        assert ll_new == pytest.approx(ll_old)
+
+    def test_process_variance_inflates_sample_spread(self, rng):
+        state = np.array([100.0, 0.0])
+        obs = BLIObservation(alpha=1000.0, sigma_log=0.1)
+        plain = [obs.sample(state, rng) for _ in range(2000)]
+        with_proc = [
+            obs.sample(state, rng, process_variance=1e6) for _ in range(2000)
+        ]
+        assert np.std(np.log(with_proc)) > np.std(np.log(plain))
+
 
 class TestTissueAttenuation:
     def test_no_depth(self):

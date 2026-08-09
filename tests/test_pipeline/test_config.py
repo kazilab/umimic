@@ -78,7 +78,23 @@ class TestExperimentConfig:
         )
         assert config.signaling.enabled
         assert config.signaling.model == "toy_mapk_akt"
+        assert config.signaling.direction == "inhibitory"
         assert set(config.coupling.targets) == {"birth", "death"}
+
+    def test_signaling_direction_accepts_stimulatory(self):
+        config = ExperimentConfig(
+            signaling={"enabled": True, "model": "toy_mapk_akt", "direction": "stimulatory"}
+        )
+        assert config.signaling.direction == "stimulatory"
+
+    def test_pk_f_oral_defaults_to_complete_absorption(self):
+        assert ExperimentConfig().pk.f_oral == 1.0
+
+    def test_pk_f_oral_rejects_zero_and_above_one(self):
+        with pytest.raises(ValidationError, match="f_oral"):
+            ExperimentConfig(pk={"f_oral": 0.0})
+        with pytest.raises(ValidationError, match="f_oral"):
+            ExperimentConfig(pk={"f_oral": 1.5})
 
     def test_signaling_rejects_non_finite_values(self):
         with pytest.raises(

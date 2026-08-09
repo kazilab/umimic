@@ -476,7 +476,19 @@ def test_ec50_needs_multiple_concentrations_to_be_identifiable():
     )
     idx = one.param_names.index("ec50_death")
     assert one.scores[idx] < many.scores[idx]
-    assert many.n_identifiable > one.n_identifiable
+
+    # `n_identifiable` is deliberately not asserted here. The analysis is now
+    # based on the observed Fisher information, which is only PSD at a
+    # stationary point; `theta` above is a hand-picked operating point, not a
+    # fitted one, so directions with upward curvature are clipped to zero and
+    # the rank undercounts for both designs alike. The per-parameter score is
+    # the claim this test is about.
+
+    # A noise parameter must be assessable at all: under the old mean-based
+    # sensitivity it had an identically zero column and was always reported
+    # unidentifiable, which is the opposite of the truth.
+    od = one.param_names.index("overdispersion")
+    assert one.scores[od] > 0.1
 
 
 # ---------------------------------------------------------------------------

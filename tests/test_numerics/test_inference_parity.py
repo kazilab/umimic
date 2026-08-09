@@ -303,14 +303,16 @@ def test_all_rates_at_uses_the_same_density_total_as_the_solvers():
     # 100 viable cells, 900 corpses: well below K on any viable measure.
     state = np.array([100.0, 0.0, 900.0])
     reported = rates.all_rates_at(0.0, state, topology)
-    assert reported["birth"] > 0.0
+    # Division is reported per dividing state, so a model with a per-state
+    # birth rate (a resistant clone) can be represented at all.
+    assert reported["birth_P"] > 0.0
 
     # And it agrees with what the ODE actually uses.
     expected = rates.birth_rate(
         0.0, topology.density_total(state), topology.carrying_capacity,
         cell_type=CellType.P,
     )
-    assert reported["birth"] == pytest.approx(expected)
+    assert reported["birth_P"] == pytest.approx(expected)
 
 
 def test_ode_docstring_describes_resistant_division():

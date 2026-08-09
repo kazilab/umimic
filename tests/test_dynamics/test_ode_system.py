@@ -4,7 +4,7 @@ import numpy as np
 
 from umimic.dynamics.ode_system import CellDynamicsODE, build_ode_system
 from umimic.dynamics.states import CellType, ModelTopology
-from umimic.dynamics.rates import RateSet
+from umimic.dynamics.rates import EmaxHill, RateSet
 
 
 class TestCellDynamicsODE:
@@ -105,3 +105,115 @@ class TestThreeStateODE:
 
         # A should increase (cells dying)
         assert result.populations["A"][-1] > 0
+
+
+class TestLinearFastPath:
+    """The matrix-exponential path must be exact where it applies, and must
+    decline to apply anywhere the system is not linear and time-invariant."""
+
+    @staticmethod
+    def _rates():
+        return RateSet(
+            birth_base=0.05,
+            death_base={CellType.P: 0.012, CellType.Q: 0.006},
+            death_modulation={
+                CellType.P: EmaxHill(emax=0.4, ec50=2.0, hill=1.5)
+            },
+            transition_base={
+                (CellType.P, CellType.Q): 0.005,
+                (CellType.Q, CellType.P): 0.003,
+            },
+            clearance_rate=0.1,
+        )
+
+    def test_matches_integrator_across_topologies_and_doses(self):
+        """Same answer as numerical integration, to integrator tolerance."""
+        topologies = [
+            ModelTopology.two_state(),
+            ModelTopology.three_state(),
+            ModelTopology.four_state(),
+        ]
+        t_eval = np.linspace(0, 88, 23)
+        for topology in topologies:
+            for conc in (0.0, 1.0, 25.0):
+                ode = CellDynamicsODE(self._rates(), topology, lambda t, c=conc: c)
+                y0 = np.zeros(len(topology.active_states))
+                y0[0] = 500.0
+                fast = ode.solve(y0, (0, 88), t_eval)
+                slow = ode.solve(y0, (0, 88), t_eval, linear_fast_path=False)
+                assert fast.metadata["method"] == "expm"
+                for state in topology.active_states:
+                    np.testing.assert_allclose(
+                        fast.populations[state.name],
+                        slow.populations[state.name],
+                        rtol=1e-5,
+                        atol=1e-6,
+                    )
+
+    def test_exact_for_known_closed_form(self):
+        """Exponential growth is reproduced to machine precision, not to
+        integrator tolerance -- the point of the fast path."""
+        topology = ModelTopology(
+            active_states=[CellType.P],
+            transitions=[],
+            division_states=[CellType.P],
+            death_states=[],
+        )
+        ode = CellDynamicsODE(
+            RateSet(birth_base=0.04, death_base={}, transition_base={}),
+            topology,
+            lambda t: 0.0,
+        )
+        t_eval = np.linspace(0, 72, 25)
+        result = ode.solve(np.array([100.0]), (0, 72), t_eval)
+        assert result.metadata["method"] == "expm"
+        np.testing.assert_allclose(
+            result.populations["P"], 100.0 * np.exp(0.04 * t_eval), rtol=1e-12
+        )
+
+    def test_non_uniform_time_grid(self):
+        """Recorded times need not be evenly spaced."""
+        topology = ModelTopology.three_state()
+        t_eval = np.array([0.0, 1.0, 3.0, 7.0, 19.0, 48.0, 72.0])
+        ode = CellDynamicsODE(self._rates(), topology, lambda t: 2.0)
+        y0 = np.array([500.0, 0.0, 0.0])
+        fast = ode.solve(y0, (0, 72), t_eval)
+        slow = ode.solve(y0, (0, 72), t_eval, linear_fast_path=False)
+        assert fast.metadata["method"] == "expm"
+        for state in topology.active_states:
+            np.testing.assert_allclose(
+                fast.populations[state.name],
+                slow.populations[state.name],
+                rtol=1e-5,
+                atol=1e-6,
+            )
+
+    def test_declines_time_varying_exposure(self):
+        """A decaying PK exposure makes the generator time-varying."""
+        topology = ModelTopology.three_state()
+        ode = CellDynamicsODE(
+            self._rates(), topology, lambda t: 5.0 * np.exp(-0.05 * t)
+        )
+        result = ode.solve(np.array([500.0, 0.0, 0.0]), (0, 72),
+                           np.linspace(0, 72, 13))
+        assert result.metadata["method"] != "expm"
+
+    def test_declines_density_dependence(self):
+        """Density-dependent growth is non-linear in the state."""
+        topology = ModelTopology.three_state()
+        topology.density_dependent = True
+        topology.carrying_capacity = 1e4
+        ode = CellDynamicsODE(self._rates(), topology, lambda t: 1.0)
+        result = ode.solve(np.array([500.0, 0.0, 0.0]), (0, 72),
+                           np.linspace(0, 72, 13))
+        assert result.metadata["method"] != "expm"
+
+    def test_declines_time_varying_rate_multiplier(self):
+        topology = ModelTopology.three_state()
+        ode = CellDynamicsODE(
+            self._rates(), topology, lambda t: 1.0,
+            rate_multiplier_fn=lambda t, key: 1.0 + 0.5 * np.sin(t),
+        )
+        result = ode.solve(np.array([500.0, 0.0, 0.0]), (0, 72),
+                           np.linspace(0, 72, 13))
+        assert result.metadata["method"] != "expm"

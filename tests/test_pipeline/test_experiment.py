@@ -5,7 +5,10 @@ import pytest
 
 from umimic.pipeline.config import ExperimentConfig
 from umimic.pipeline.experiment import Experiment
+from umimic.pipeline.transfer import TransferLearning
 from umimic.dynamics.rates import RateSet
+from umimic.pk.dosing import Dose, DosingSchedule
+from umimic.types import InferenceResult, MLEResult
 
 
 class TestExperiment:
@@ -15,6 +18,70 @@ class TestExperiment:
         exp = Experiment(config)
         assert exp.topology is not None
         assert exp.observation_model is not None
+
+    def test_pk_f_oral_reaches_one_compartment_model(self):
+        """Incomplete oral absorption must scale C(t) through Experiment."""
+        cfg = ExperimentConfig(
+            pk={
+                "model": "one_compartment",
+                "vd": 10.0,
+                "ke": 0.1,
+                "ka": 0.5,
+                "f_oral": 0.5,
+            },
+            dosing={
+                "type": "oral",
+                "dose_amount": 100.0,
+                "interval": 24.0,
+                "n_doses": 1,
+                "start_time": 0.0,
+            },
+            simulation={"t_max": 24.0, "dt_obs": 6.0},
+        )
+        exp = Experiment(cfg)
+        # Build equivalent full-F PK for comparison
+        from umimic.pk.compartment import OneCompartmentPK
+
+        full = OneCompartmentPK(vd=10.0, ke=0.1, ka=0.5, f_oral=1.0)
+        half = OneCompartmentPK(vd=10.0, ke=0.1, ka=0.5, f_oral=0.5)
+        dosing = DosingSchedule(doses=[Dose(0.0, 100.0, route="oral")])
+        t = np.linspace(0.1, 24, 50)
+        np.testing.assert_allclose(
+            half.solve(dosing, t), 0.5 * full.solve(dosing, t), rtol=1e-8
+        )
+        # Experiment exposure uses the configured F
+        c_exp = np.array([exp.exposure(float(tt)) for tt in t])
+        np.testing.assert_allclose(c_exp, half.solve(dosing, t), rtol=1e-6)
+
+    def test_transfer_shrinkage_must_be_positive(self):
+        mle = MLEResult(
+            parameters={"b0": 0.04},
+            log_likelihood=0.0,
+            aic=0.0,
+            bic=0.0,
+        )
+        ir = InferenceResult(method="mle", mle=mle)
+        with pytest.raises(ValueError, match="shrinkage"):
+            TransferLearning(ir, transfer_params=["b0"], shrinkage=0.0)
+        with pytest.raises(ValueError, match="shrinkage"):
+            TransferLearning(ir, transfer_params=["b0"], shrinkage=1.5)
+        # b0 is a rate, so it is no longer transferred without an explicit in
+        # vitro -> in vivo scale factor: an unscaled rate produces a narrow
+        # prior centred on the wrong value, which sparse in vivo data cannot
+        # overcome. Supplying the factor makes it transferable again.
+        ok = TransferLearning(
+            ir,
+            transfer_params=["b0"],
+            shrinkage=0.5,
+            scale_factors={"b0": 0.25},
+        )
+        assert "b0" in ok.build_priors().distributions
+
+        # Without the factor it is skipped, with the reason recorded rather
+        # than dropped silently.
+        skipped = TransferLearning(ir, transfer_params=["b0"], shrinkage=0.5)
+        assert "b0" not in skipped.build_priors().distributions
+        assert "b0" in skipped.skipped
 
     def test_simulate_ode(self):
         """ODE simulation should produce valid results."""
@@ -85,6 +152,39 @@ class TestExperiment:
         assert "signaling" in result.metadata
         assert result.metadata["signaling"]["enabled"] is True
         assert result.metadata["signaling"]["coupling_mode"] == "direct_rate_multiplier"
+        assert result.metadata["signaling"]["direction"] == "inhibitory"
+        assert "1 + max_effect" in result.metadata["signaling"]["coupling_formula"]
+
+    def test_signaling_direction_from_config(self):
+        """stimulatory direction must be selectable via SignalingConfig."""
+        config = ExperimentConfig(
+            simulation={"method": "ode", "t_max": 6.0, "dt_obs": 3.0},
+            signaling={
+                "enabled": True,
+                "model": "toy_mapk_akt",
+                "direction": "stimulatory",
+            },
+            coupling={
+                "enabled": True,
+                "targets": ["birth"],
+                "parameters": {"max_effect": 0.1},
+            },
+        )
+        result = Experiment(config).simulate(method="ode")
+        assert result.metadata["signaling"]["direction"] == "stimulatory"
+
+    def test_unknown_signaling_initial_state_is_rejected(self):
+        config = ExperimentConfig(
+            simulation={"method": "ode", "t_max": 6.0, "dt_obs": 3.0},
+            signaling={
+                "enabled": True,
+                "model": "toy_mapk_akt",
+                "initial_state": {"not_a_node": 0.5},
+            },
+            coupling={"enabled": True, "targets": ["birth"]},
+        )
+        with pytest.raises(ValueError, match="Unknown signaling initial_state"):
+            Experiment(config).simulate(method="ode")
 
     def test_direct_rate_coupling_changes_trajectory(self):
         """Direct signaling rate multipliers should alter ODE trajectories."""

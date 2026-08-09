@@ -28,3 +28,22 @@ class TestTumorVolumeObservation:
         for _ in range(100):
             v = obs.sample(state, rng)
             assert v > 0
+
+    def test_param_names_include_sigma_v(self):
+        assert TumorVolumeObservation().param_names() == ["beta", "sigma_v"]
+
+    def test_sample_respects_sigma_v_override(self, rng):
+        state = np.array([1000.0, 0.0])
+        obs = TumorVolumeObservation(beta=1e-3, sigma_v=0.05)
+        tight = [obs.sample(state, rng, {"sigma_v": 0.05}) for _ in range(2000)]
+        loose = [obs.sample(state, rng, {"sigma_v": 0.8}) for _ in range(2000)]
+        assert np.std(np.log(loose)) > np.std(np.log(tight)) * 2
+
+    def test_process_variance_inflates_sample_spread(self, rng):
+        state = np.array([1000.0, 0.0])
+        obs = TumorVolumeObservation(beta=1e-3, sigma_v=0.1)
+        plain = [obs.sample(state, rng) for _ in range(2000)]
+        with_proc = [
+            obs.sample(state, rng, process_variance=1e6) for _ in range(2000)
+        ]
+        assert np.std(np.log(with_proc)) > np.std(np.log(plain))

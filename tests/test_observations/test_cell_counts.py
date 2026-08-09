@@ -70,3 +70,24 @@ class TestCellCountObservation:
         state = np.array([0.0, 0.0, 0.0, 0.0])
         ll = obs.log_likelihood(0.0, state)
         assert np.isfinite(ll)
+
+    def test_sample_respects_overdispersion_override(self, rng):
+        """params['overdispersion'] must reach sample(), not only log_likelihood."""
+        state = np.array([200.0, 0.0])
+        obs = CellCountObservation(overdispersion=50.0)
+        tight = [obs.sample(state, rng, {"overdispersion": 80.0}) for _ in range(3000)]
+        loose = [obs.sample(state, rng, {"overdispersion": 3.0}) for _ in range(3000)]
+        assert np.var(loose) > np.var(tight)
+
+    def test_sample_with_process_variance_inflates_spread(self, rng):
+        """Process variance uses the Gaussian branch and widens replicates."""
+        state = np.array([200.0, 0.0])
+        obs = CellCountObservation(overdispersion=50.0)
+        plain = [obs.sample(state, rng) for _ in range(3000)]
+        with_proc = [
+            obs.sample(state, rng, process_variance=5000.0) for _ in range(3000)
+        ]
+        assert np.var(with_proc) > np.var(plain)
+
+    def test_param_names_match_inference_keys(self):
+        assert CellCountObservation().param_names() == ["overdispersion"]

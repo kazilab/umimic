@@ -54,9 +54,10 @@ class TestOneCompartmentPK:
 
     def test_oral_absorption(self):
         """Oral dosing should show absorption phase then decay."""
+        from umimic.pk.dosing import Dose
+
         pk = OneCompartmentPK(vd=10.0, ke=0.1, ka=1.0)
-        dosing = DosingSchedule.single_bolus(100.0)
-        dosing.doses[0].route = "oral"
+        dosing = DosingSchedule(doses=[Dose(0.0, 100.0, route="oral")])
         t_eval = np.linspace(0.1, 48, 200)
         C = pk.solve(dosing, t_eval)
 
@@ -64,6 +65,33 @@ class TestOneCompartmentPK:
         peak_idx = np.argmax(C)
         assert peak_idx > 0
         assert peak_idx < len(C) - 1
+
+    def test_oral_bioavailability_scales_exposure(self):
+        """F < 1 reduces less drug and scales a linear oral profile by F."""
+        from umimic.pk.dosing import Dose
+
+        dosing = DosingSchedule(doses=[Dose(0.0, 100.0, route="oral")])
+        t = np.linspace(0.1, 48, 100)
+        full = OneCompartmentPK(vd=10.0, ke=0.1, ka=0.5, f_oral=1.0).solve(
+            dosing, t
+        )
+        half = OneCompartmentPK(vd=10.0, ke=0.1, ka=0.5, f_oral=0.5).solve(
+            dosing, t
+        )
+        np.testing.assert_allclose(half, 0.5 * full, rtol=1e-8)
+
+    def test_f_oral_does_not_scale_iv_bolus(self):
+        dosing = DosingSchedule.single_bolus(100.0)
+        t = np.linspace(0, 24, 50)
+        a = OneCompartmentPK(vd=10.0, ke=0.1, f_oral=0.3).solve(dosing, t)
+        b = OneCompartmentPK(vd=10.0, ke=0.1, f_oral=1.0).solve(dosing, t)
+        np.testing.assert_allclose(a, b)
+
+    def test_rejects_invalid_f_oral(self):
+        with pytest.raises(ValueError, match="f_oral"):
+            OneCompartmentPK(f_oral=0.0)
+        with pytest.raises(ValueError, match="f_oral"):
+            OneCompartmentPK(f_oral=1.5)
 
 
 class TestTwoCompartmentPK:
