@@ -1,12 +1,14 @@
-# API Reference
+# API reference
 
-This page provides an overview of U-MIMIC's public Python API, organized by module.
+Public Python API overview by module. For formulas and contracts see
+{doc}`scientific-assumptions`.
 
 ## Pipeline
 
 ### `umimic.pipeline.experiment.Experiment`
 
-The main user-facing class that ties all components together.
+Primary orchestrator: builds topology, rates, observations, and exposure from
+config; runs simulation, synthetic data, and fit.
 
 ```python
 from umimic.pipeline.config import ExperimentConfig
@@ -16,156 +18,189 @@ config = ExperimentConfig(name="my_exp")
 exp = Experiment(config)
 ```
 
-**Methods:**
+**Methods**
 
-- `simulate(rate_set=None, method=None, concentrations=None)` -- Run forward simulation.
-  Returns `SimulationResult` or `dict[float, SimulationResult]` for dose-response.
-- `generate_synthetic(rate_set=None)` -- Generate synthetic `ExperimentalDataset`.
-- `fit(data, **kwargs)` -- Run inference. Returns `InferenceResult`.
+- `simulate(rate_set=None, method=None, concentrations=None)` — Forward
+  simulation. With `concentrations`, returns plate-style
+  `dict[float, SimulationResult]` (constant C per arm). Otherwise uses
+  `self.exposure` (constant or PK).
+- `generate_synthetic(rate_set=None)` — `ExperimentalDataset` from config.
+- `fit(data, **kwargs)` — MLE or emcee MCMC → `InferenceResult`.
 
 ### `umimic.pipeline.config`
 
-- `load_config(path)` -- Load and validate a YAML config file into `ExperimentConfig`.
-- `save_config(config, path)` -- Save an `ExperimentConfig` to YAML.
-- `ExperimentConfig` -- Top-level Pydantic model (see {doc}`configuration`).
+- `load_config(path)` / `save_config(config, path)` — YAML I/O (JSON-mode dump
+  so transitions round-trip without `!!python/tuple`).
+- `ExperimentConfig` and nested configs — see {doc}`configuration`.
+
+### `umimic.pipeline.results`
+
+- `save_result(result, path)` — JSON summary (MLE stats; MCMC mean/std/CI, not
+  full chains).
+- `load_result(path)` — `dict` (not a live `InferenceResult`).
+- `compare_results({label: InferenceResult})` — side-by-side estimates.
+
+### `umimic.pipeline.transfer`
+
+- `TransferLearning(invitro_result, transfer_params, shrinkage)` —
+  in vitro MCMC/MLE → lognormal priors. `shrinkage` ∈ (0, 1].
+- `build_priors()` → `PriorSpec`; `summarize_transfer()`.
+
+---
 
 ## Dynamics
 
 ### `umimic.dynamics.states`
 
-- `CellType` -- Enum: `P` (proliferating), `Q` (quiescent), `A` (apoptotic), `R` (resistant).
-- `ModelTopology` -- Defines which states and transitions are active.
-  Factory methods: `two_state()`, `three_state()`, `four_state()`.
+- `CellType` — `P`, `Q`, `A`, `R`.
+- `ModelTopology` — active states, transitions, division/death, density mask.
+  Factories: `two_state()`, `three_state()`, `four_state()`,
+  `persister_resistance()`.
+- `StateVector` — snapshot helper.
 
 ### `umimic.dynamics.rates`
 
-- `RateSet` -- Complete parameter set for concentration-modulated birth, death,
-  and transition rates. See docstring for the inference parameter naming convention.
-  Factory methods: `cytotoxic_drug()`, `cytostatic_drug()`.
-- `DoseResponseFunction` -- Abstract base for dose-response curves.
-- `EmaxHill` -- Emax/Hill model: `Emax * C^Hill / (EC50^Hill + C^Hill)`.
-- `FourParameterLogistic` -- 4PL sigmoidal model.
-- `ConstantRate` -- Constant (no drug modulation).
+- `RateSet` — concentration-modulated birth, death, transitions.
+  - Growth: `asymptotic_growth_rate(c, topology)`, `doubling_time`,
+    `gr_value`, `finite_horizon_gr`, `stable_state_fractions`.
+  - `net_growth_rate(c)` — **only** \(b - d_P\); not multi-state growth.
+  - Factories: `cytotoxic_drug`, `cytostatic_drug`, `mixed_drug`,
+    `resistant_clone`, `persister_resistance` / `from_profiles`.
+- Dose–response: `EmaxHill`, `HillFoldChange`, `FourParameterLogistic`
+  (use `.as_effect()` for modulators), `ConstantRate`.
+- Profiles: `PhenotypeRateProfile`, `TransitionRateProfile`.
 
-### `umimic.dynamics.ode_system`
+### Solvers
 
-- `CellDynamicsODE` -- Deterministic ODE solver using `scipy.integrate.solve_ivp`.
-  Methods: `solve(y0, t_span, t_eval)`, `solve_dose_response(y0, t_span, concentrations, t_eval)`.
+| Class | Module | Role |
+|-------|--------|------|
+| `CellDynamicsODE` | `ode_system` | Mean-field ODE; optional `rate_multiplier_fn` |
+| `GillespieSimulator` | `gillespie` | SSA; Extrande if exposure varies |
+| `TauLeapingSimulator` | `tau_leaping` | Hybrid leap + critical reactions |
+| `MomentODE` | `moment_equations` | LNA mean + covariance |
 
-### `umimic.dynamics.gillespie`
-
-- `GillespieSimulator` -- Exact stochastic simulation (Gillespie SSA).
-  Method: `simulate(y0, t_max, t_eval)`.
-
-### `umimic.dynamics.tau_leaping`
-
-- `TauLeapingSimulator` -- Approximate stochastic simulation.
-  Method: `simulate(y0, t_max, t_eval)`.
-
-### `umimic.dynamics.moment_equations`
-
-- `MomentODE` -- Linear Noise Approximation: solves mean + covariance dynamics.
-  Method: `solve(mu0, t_span, t_eval)`.
+---
 
 ## Pharmacokinetics
 
 ### `umimic.pk.exposure`
 
-- `ExposureProfile` -- Unified drug concentration interface.
-  - `ExposureProfile.constant(concentration)` -- In-vitro constant exposure.
-  - `ExposureProfile.from_pk(pk_model, dosing)` -- In-vivo PK-driven exposure.
-  - `concentration(t)` -- Get concentration at time `t`.
+- `ExposureProfile.constant(c)` / `.from_pk(pk, dosing)`
+- `concentration(t)` / `__call__(t)`
+- `precompute(t_grid)` / `clear_cache()` — optional linear interpolation
 
 ### `umimic.pk.compartment`
 
-- `OneCompartmentPK(vd, ke, ka=None)` -- One-compartment PK model.
-- `TwoCompartmentPK(vc, vp, cl, q, ka=None)` -- Two-compartment PK model.
+- `OneCompartmentPK(vd, ke, ka=None, f_oral=1.0)`
+- `TwoCompartmentPK(vc, vp, cl, q, ka=None, f_oral=1.0)`
+- `solve(dosing, t_eval)` — multi-dose, grid-invariant integration
 
 ### `umimic.pk.dosing`
 
-- `DosingSchedule` -- Dosing event schedule.
-  Factory methods: `constant_invitro(conc)`, `single_bolus(dose, time)`,
-  `repeated(dose, interval, n_doses)`, `oral_repeated(...)`.
+- `Dose`, `DosingSchedule` —
+  `constant_invitro`, `single_bolus`, `repeated`, `oral_repeated`
+
+### `umimic.pk.luciferin`
+
+- `LuciferinKinetics` — phenomenological substrate timing (minutes)
+- `TissueAttenuation` — point source or volume-averaged attenuation
+
+---
 
 ## Observations
 
-### `umimic.observations.base`
+All models accept `topology=` so operators match the state layout.
 
-- `ObservationModel` -- Abstract base class.
-  Methods: `log_likelihood(obs, latent, params)`, `sample(latent, params)`, `param_names()`.
+| Class | Likelihood | Notes |
+|-------|------------|--------|
+| `CellCountObservation` | NegBin or Gaussian+process | Keys: `overdispersion` |
+| `BLIObservation` | Lognormal (median scale) | Keys: `sigma_log_bli`; luciferin + attenuation |
+| `TumorVolumeObservation` | Lognormal | Keys: `sigma_v`; `beta` calibration |
+| `BiomarkerObservation` | Beta fractions | `ki67` / `caspase`; key `biomarker_precision` |
+| `MultimodalObservation` | Sum of available modalities | Conditional independence given \(x\) |
 
-### `umimic.observations.cell_counts`
+`sample(..., process_variance=...)` matches the log-likelihood noise model
+(used by posterior predictive checks).
 
-- `CellCountObservation(overdispersion)` -- Negative Binomial observation model
-  for discrete cell counts. Supports LNA-informed variance.
-
-### `umimic.observations.bli`
-
-- `BLIObservation(alpha, sigma_log)` -- Bioluminescence imaging observation model.
-
-### `umimic.observations.tumor_volume`
-
-- `TumorVolumeObservation(beta, sigma_v)` -- Tumor volume observation model.
-
-### `umimic.observations.multimodal`
-
-- `MultimodalObservation(models)` -- Combines multiple observation models.
+---
 
 ## Inference
 
 ### `umimic.inference.likelihood`
 
-- `ModelLikelihood(topology, data, param_names, mode, observation_model)` --
-  Central log-likelihood function. Groups replicates by concentration to share
-  ODE solutions. Callable: `likelihood(theta) -> float`.
+- `ModelLikelihood(topology, data, param_names, mode, observation_model, …)`
+- `PARAMETER_SETS`: `default`, `mechanism`, `resistance`, `persister`
+- `build_rate_set(params)`, `KNOWN_PARAM_NAMES`, `resolve_initial_fractions`
 
-### `umimic.inference.mle`
+### Point estimation and sampling
 
-- `MLEstimator(likelihood, bounds, priors, method)` -- Maximum likelihood estimation.
-  Methods: `fit(initial_guess, n_restarts) -> MLEResult`.
+| Class | Role |
+|-------|------|
+| `MLEstimator` | Multi-start MLE / MAP |
+| `MCMCSampler` | emcee only (`backend="emcee"`) |
+| `ExtendedKalmanFilter` | LNA + Gaussian observation updates |
+| `ParticleFilter` / `ParticleMCMC` | Bootstrap PF + PMCMC |
+| `HierarchicalModel` | Partial pooling across series |
+| `PriorSpec` | `default_invitro`, `default_mechanism`, `default_resistance`, `default_persister` |
 
-### `umimic.inference.mcmc`
+### Diagnostics
 
-- `MCMCSampler(likelihood, priors, backend)` -- MCMC sampling (emcee or PyMC).
-  Methods: `sample(n_samples, n_chains, n_warmup) -> MCMCResult`.
+- `compute_rhat`, `effective_sample_size`, `summarize_mcmc`
+- `posterior_predictive_check` (scored mask + process variance when available)
+- `analyze_identifiability`, `likelihood_identifiability`
 
-### `umimic.inference.priors`
+Sample layout: `(n_chains, n_draws)` per parameter.
 
-- `PriorSpec` -- Prior distribution specification.
-  Methods: `log_prior(params) -> float`, `sample(rng) -> dict`.
-  Factory: `PriorSpec.default_invitro()`.
+---
+
+## Signaling
+
+- `SignalingNetwork` — abstract interface
+- `ToyMapkAktNetwork` — two-node scaffold (not a pathway model);
+  `direction="inhibitory"` default
+
+Coupling into cell rates is built in `Experiment` for ODE only.
+
+---
+
+## Visualization
+
+| Function | Notes |
+|----------|--------|
+| `plot_population_trajectories` | ODE / single run |
+| `plot_ensemble` | Percentile bands by default (`ci_method`) |
+| `plot_dose_response_trajectories` | Multi-concentration curves |
+| `plot_rate_dose_response` | Rates + asymptotic growth |
+| `plot_net_growth_curve` | Asymptotic \(g(C)\); g0/g50 annotations |
+| `plot_mechanism_comparison` | P birth vs death fold-change |
+| `plot_posterior_marginals` / `plot_pair` | Pooled posteriors |
+| `plot_trace` | **One line per chain/walker** |
+| `plot_residuals` / `plot_fit_quality` | Exploratory fit checks |
+
+---
 
 ## Data
 
-### `umimic.data.schemas`
+### Schemas
 
-- `TimeSeriesData` -- Single replicate: `times`, `observations` dict, `concentration`.
-- `ExperimentalDataset` -- Collection of `TimeSeriesData` with metadata.
+- `TimeSeriesData` — times, observations dict, concentration, metadata
+- `ExperimentalDataset` — collection of series
 
-### `umimic.data.synthetic`
+### Synthetic and public data
 
-- `SyntheticDataGenerator(rate_set, topology, obs_model, rng)` --
-  Methods: `generate_invitro_plate(...)`, `generate_invivo_cohort(...)`.
+- `SyntheticDataGenerator` — `generate_invitro_plate`, `generate_invivo_cohort`
+- `load_csv`, `load_bestdr`, `load_phenopop`, `load_tshs_tumor`,
+  `load_hafner_gr`, `load_nci60`, `list_available_datasets`
 
-### `umimic.data.loaders`
+---
 
-- `load_csv(path, data_config)` -- Load experimental data from CSV.
+## Result types (`umimic.types`)
 
-### `umimic.data.public_datasets`
-
-- `load_bestdr(data_root, cell_line, drug)` -- BESTDR breast cancer data.
-- `load_phenopop(data_root, population)` -- PhenoPop Ba/F3 imaging data.
-- `load_tshs_tumor(data_root, treatment_group)` -- TSHS xenograft tumor volumes.
-- `load_hafner_gr(data_root, cell_line, drug)` -- Hafner/Niepel GR metrics.
-- `load_nci60(data_path, cell_line)` -- NCI-60 growth inhibition.
-- `list_available_datasets()` -- List datasets and their download status.
-
-## Result Types
-
-Defined in `umimic.types`:
-
-- `SimulationResult` -- Forward simulation output (`times`, `populations` dict).
-- `EnsembleResult` -- Multiple stochastic trajectories.
-- `MLEResult` -- MLE output (`parameters`, `log_likelihood`, `aic`, `bic`, `se`, `converged`).
-- `MCMCResult` -- MCMC output (`samples`, diagnostics).
-- `InferenceResult` -- Unified container (`method`, `mle`, `mcmc`, `context`).
+| Type | Contents |
+|------|----------|
+| `SimulationResult` | `times`, `populations`, `viable`, `metadata` |
+| `EnsembleResult` | trajectories; `mean()`, `std()` |
+| `FilterResult` | EKF means/covs, marginal LL, `diverged` |
+| `MLEResult` | parameters, LL, AIC/BIC, SE, converged |
+| `MCMCResult` | samples `(n_chains, n_draws)`, traces, diagnostics |
+| `InferenceResult` | `method`, `mle` and/or `mcmc`, `context` |
