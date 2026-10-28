@@ -335,3 +335,21 @@ class TestExperiment:
         high = Experiment(high_k_cfg).simulate(method="ode")
         assert not np.allclose(low.populations["P"], high.populations["P"])
         assert high.metadata["signaling"]["k_by_target"]["birth"] == pytest.approx(5.0)
+
+
+
+def test_transfer_skips_a_parameter_the_in_vitro_data_did_not_pin_down():
+    mle = MLEResult(
+        parameters={"hill_death": 0.3, "emax_death": 0.5},
+        log_likelihood=0.0,
+        aic=0.0,
+        bic=0.0,
+        se={"hill_death": 6.0, "emax_death": 0.05},  # relative SE 20 and 0.1
+    )
+    transfer = TransferLearning(InferenceResult(method="mle", mle=mle))
+    priors = transfer.build_priors()
+    assert "hill_death" not in priors.distributions
+    assert "barely constrain" in transfer.skipped["hill_death"]
+    assert priors.distributions["emax_death"].kwds["s"] == pytest.approx(0.1)
+    summary = transfer.summarize_transfer()
+    assert np.isfinite(summary["parameters"]["emax_death"]["prior_mean"])

@@ -12,7 +12,7 @@ from umimic.data import (
     load_nci60,
     resolve_nci60_nsc,
 )
-from umimic.data.public_datasets import DATA_ROOT
+from umimic.data.public_datasets import DATA_ROOT, nci60_index
 
 
 @pytest.fixture(scope="module")
@@ -21,6 +21,15 @@ def nci_product() -> Path:
     if not path.exists():
         pytest.skip("NCI-60 product not present")
     return path
+
+
+def test_nci60_index_counts_the_series_a_filtered_load_builds(nci_product: Path):
+    index = nci60_index()
+    assert list(index.columns) == ["NSC", "cell_line", "panel"]
+    chosen = index[(index["NSC"] == "119875") & (index["cell_line"] == "MCF7")]
+    loaded = load_nci60(nsc="119875", cell_line="MCF7", max_series=None)
+    exact = [s for s in loaded.series if s.metadata["cell_line"] == "MCF7"]
+    assert 0 < len(exact) <= len(chosen)
 
 
 def test_resolve_nci60_nsc_aliases():

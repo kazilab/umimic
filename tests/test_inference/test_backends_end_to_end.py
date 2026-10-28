@@ -24,6 +24,7 @@ from umimic.inference.mcmc import MCMCSampler
 from umimic.inference.priors import PriorSpec
 from umimic.inference.smc import ParticleFilter, ParticleMCMC
 from umimic.observations.cell_counts import CellCountObservation
+from umimic.pk.exposure import ExposureProfile
 
 TRUE_B0 = 0.05
 TRUE_D0 = 0.01
@@ -46,7 +47,7 @@ def growth_data(topology):
         },
     )
     times = np.linspace(0, 72, 10)
-    result = CellDynamicsODE(truth, topology, lambda _t: 0.0).solve(
+    result = CellDynamicsODE(truth, topology, ExposureProfile.constant(0.0)).solve(
         np.array([300.0, 0.0]), (0, 72), times
     )
     counts = np.round(result.populations["P"] + result.populations["Q"])
@@ -271,12 +272,53 @@ def test_posterior_predictive_check_uses_stable_initial_fractions(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("constant", [True, False])
+def test_particle_clock_shift_preserves_exposure_metadata(topology, monkeypatch, constant):
+    from umimic.dynamics.gillespie import GillespieSimulator
+    from umimic.pk.exposure import exposure_breakpoints, is_constant_exposure
+
+    class DelayedExposure:
+        def __call__(self, time):
+            return float(time >= 3.)
+
+        def breakpoints(self, start, end):
+            return [3.] if start < 3. < end else []
+
+    exposure = ExposureProfile.constant(0.) if constant else DelayedExposure()
+    recorded = []
+    original = GillespieSimulator.simulate
+
+    def track(self, state, t_max, *args, **kwargs):
+        recorded.append((
+            is_constant_exposure(self.exposure_fn),
+            exposure_breakpoints(self.exposure_fn, 0., t_max),
+            self.exposure_fn(1.5),
+        ))
+        return original(self, state, t_max, *args, **kwargs)
+
+    monkeypatch.setattr(GillespieSimulator, "simulate", track)
+    rates = RateSet(birth_base=0., death_base={CellType.P: 0., CellType.Q: 0.}, transition_base={})
+    data = TimeSeriesData.from_counts([0., 2., 4.], [4., 4., 4.])
+    ParticleFilter(
+        rates, topology, exposure, CellCountObservation(topology=topology),
+        n_particles=2, rng=np.random.default_rng(7),
+    ).filter(data, np.array([4., 0.]))
+    assert len(recorded) == 4
+    if constant:
+        assert all(marked for marked, _, _ in recorded)
+    else:
+        assert all(not marked for marked, _, _ in recorded)
+        np.testing.assert_array_equal(recorded[0][1], [])
+        np.testing.assert_array_equal(recorded[-1][1], [1.])
+        assert recorded[0][2] == 0. and recorded[-1][2] == 1.
+
+
 def test_particle_filter_tracks_the_data(topology, growth_data):
     truth = RateSet(
         birth_base=TRUE_B0, death_base={CellType.P: TRUE_D0, CellType.Q: 0.005}
     )
     pf = ParticleFilter(
-        truth, topology, lambda _t: 0.0,
+        truth, topology, ExposureProfile.constant(0.0),
         CellCountObservation(20.0, topology=topology),
         n_particles=40, rng=np.random.default_rng(1),
     )
@@ -292,26 +334,32 @@ def test_particle_filter_tracks_the_data(topology, growth_data):
 def test_marginal_likelihood_is_higher_at_the_generating_parameters(topology,
                                                                     growth_data):
     """The estimator must prefer the truth to a clearly wrong rate."""
+    # The contrast is already decisive over the first 24 hours. Simulating
+    # the deliberately excessive birth rate for 72 hours creates millions of
+    # events and tests exponential population size rather than filter scoring.
+    data = growth_data.subset_times(np.arange(4))
+
     def run(b0):
         rates = RateSet(
             birth_base=b0, death_base={CellType.P: TRUE_D0, CellType.Q: 0.005}
         )
         pf = ParticleFilter(
-            rates, topology, lambda _t: 0.0,
+            rates, topology, ExposureProfile.constant(0.0),
             CellCountObservation(20.0, topology=topology),
             n_particles=40, rng=np.random.default_rng(2),
         )
-        return pf.filter(growth_data, np.array([300.0, 0.0]))[
+        return pf.filter(data, np.array([300.0, 0.0]))[
             "marginal_log_likelihood"
         ]
 
-    assert run(TRUE_B0) > run(TRUE_B0 * 3)
-    assert run(TRUE_B0) > run(TRUE_B0 * 0.2)
+    generating = run(TRUE_B0)
+    assert generating > run(TRUE_B0 * 3)
+    assert generating > run(TRUE_B0 * 0.2)
 
 
 def test_filter_weights_stay_normalised_without_resampling(topology, growth_data):
     pf = ParticleFilter(
-        RateSet(birth_base=TRUE_B0), topology, lambda _t: 0.0,
+        RateSet(birth_base=TRUE_B0), topology, ExposureProfile.constant(0.0),
         CellCountObservation(20.0, topology=topology),
         n_particles=30, rng=np.random.default_rng(3), ess_fraction=0.0,
     )
@@ -509,7 +557,7 @@ def _filter(topology, data, **kwargs):
     pf = ParticleFilter(
         RateSet(birth_base=TRUE_B0,
                 death_base={CellType.P: TRUE_D0, CellType.Q: 0.005}),
-        topology, lambda _t: 0.0,
+        topology, ExposureProfile.constant(0.0),
         CellCountObservation(20.0, topology=topology),
         n_particles=25, rng=np.random.default_rng(5), ess_fraction=0.0,
     )
@@ -570,7 +618,7 @@ def _replicate_dataset(topology, birth_rates=(0.045, 0.050, 0.055)):
         rates = RateSet(
             birth_base=b0, death_base={CellType.P: 0.01, CellType.Q: 0.005}
         )
-        result = CellDynamicsODE(rates, topology, lambda _t: 0.0).solve(
+        result = CellDynamicsODE(rates, topology, ExposureProfile.constant(0.0)).solve(
             np.array([200.0, 0.0]), (0, 48), times
         )
         counts = np.round(result.populations["P"] + result.populations["Q"])
@@ -708,7 +756,7 @@ def test_pmcmc_recovers_a_parameter_from_data(topology):
     """A short but genuine PMCMC run, at a size the SSA can sustain."""
     truth = RateSet(birth_base=0.05, death_base={CellType.P: 0.01, CellType.Q: 0.005})
     times = np.linspace(0, 48, 5)
-    result = CellDynamicsODE(truth, topology, lambda _t: 0.0).solve(
+    result = CellDynamicsODE(truth, topology, ExposureProfile.constant(0.0)).solve(
         np.array([60.0, 0.0]), (0, 48), times
     )
     counts = np.round(result.populations["P"] + result.populations["Q"])
@@ -820,7 +868,7 @@ def test_particle_filter_scores_a_bare_non_count_model(topology):
         pf = ParticleFilter(
             RateSet(birth_base=TRUE_B0,
                     death_base={CellType.P: TRUE_D0, CellType.Q: 0.005}),
-            topology, lambda _t: 0.0,
+            topology, ExposureProfile.constant(0.0),
             BLIObservation(alpha=1.0, sigma_log=0.3, topology=topology),
             n_particles=20, rng=np.random.default_rng(6), ess_fraction=0.0,
         )

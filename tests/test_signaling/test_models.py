@@ -49,3 +49,26 @@ class TestToyMapkAktNetwork:
     def test_rejects_invalid_parameters(self, kwargs, match):
         with pytest.raises(ValueError, match=match):
             ToyMapkAktNetwork(**kwargs)
+
+
+
+def test_simulation_reports_the_pathway_trajectory():
+    import numpy as np
+
+    from umimic.pipeline.config import ExperimentConfig
+    from umimic.pipeline.experiment import Experiment
+
+    config = ExperimentConfig(
+        dosing={"type": "constant", "concentrations": [1.0]},
+        simulation={"method": "ode", "t_max": 24.0, "dt_obs": 6.0},
+        signaling={"enabled": True, "model": "toy_mapk_akt"},
+        coupling={"enabled": True, "targets": ["birth"]},
+    )
+    result = Experiment(config).simulate()
+    trajectory = result.metadata["signaling"]["trajectory"]
+    assert trajectory["times"] == [0.0, 6.0, 12.0, 18.0, 24.0]
+    for node in result.metadata["signaling"]["nodes"]:
+        values = np.asarray(trajectory[node])
+        assert values.shape == (5,) and np.all((values >= 0) & (values <= 1))
+    # An inhibitor lowers pathway activity from its baseline.
+    assert trajectory["mapk"][-1] < trajectory["mapk"][0]

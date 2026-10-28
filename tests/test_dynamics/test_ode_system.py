@@ -5,6 +5,7 @@ import numpy as np
 from umimic.dynamics.ode_system import CellDynamicsODE, build_ode_system
 from umimic.dynamics.states import CellType, ModelTopology
 from umimic.dynamics.rates import EmaxHill, RateSet
+from umimic.pk.exposure import ExposureProfile
 
 
 class TestCellDynamicsODE:
@@ -136,7 +137,7 @@ class TestLinearFastPath:
         t_eval = np.linspace(0, 88, 23)
         for topology in topologies:
             for conc in (0.0, 1.0, 25.0):
-                ode = CellDynamicsODE(self._rates(), topology, lambda t, c=conc: c)
+                ode = CellDynamicsODE(self._rates(), topology, ExposureProfile.constant(conc))
                 y0 = np.zeros(len(topology.active_states))
                 y0[0] = 500.0
                 fast = ode.solve(y0, (0, 88), t_eval)
@@ -162,7 +163,7 @@ class TestLinearFastPath:
         ode = CellDynamicsODE(
             RateSet(birth_base=0.04, death_base={}, transition_base={}),
             topology,
-            lambda t: 0.0,
+            ExposureProfile.constant(0.0),
         )
         t_eval = np.linspace(0, 72, 25)
         result = ode.solve(np.array([100.0]), (0, 72), t_eval)
@@ -175,7 +176,7 @@ class TestLinearFastPath:
         """Recorded times need not be evenly spaced."""
         topology = ModelTopology.three_state()
         t_eval = np.array([0.0, 1.0, 3.0, 7.0, 19.0, 48.0, 72.0])
-        ode = CellDynamicsODE(self._rates(), topology, lambda t: 2.0)
+        ode = CellDynamicsODE(self._rates(), topology, ExposureProfile.constant(2.0))
         y0 = np.array([500.0, 0.0, 0.0])
         fast = ode.solve(y0, (0, 72), t_eval)
         slow = ode.solve(y0, (0, 72), t_eval, linear_fast_path=False)

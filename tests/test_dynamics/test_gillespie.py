@@ -5,13 +5,14 @@ import numpy as np
 from umimic.dynamics.gillespie import GillespieSimulator, build_reactions
 from umimic.dynamics.states import CellType
 from umimic.dynamics.rates import RateSet
+from umimic.pk.exposure import ExposureProfile
 
 
 class TestGillespieSimulator:
     def test_single_trajectory(self, two_state_topology, simple_rates, rng):
         """Single trajectory runs without errors."""
         sim = GillespieSimulator(
-            simple_rates, two_state_topology, lambda t: 0.0, rng
+            simple_rates, two_state_topology, ExposureProfile.constant(0.0), rng
         )
         result = sim.simulate(
             np.array([100.0, 0.0]), t_max=24, t_record=np.linspace(0, 24, 25)
@@ -23,7 +24,7 @@ class TestGillespieSimulator:
     def test_populations_nonnegative(self, two_state_topology, simple_rates, rng):
         """Populations should never go negative."""
         sim = GillespieSimulator(
-            simple_rates, two_state_topology, lambda t: 0.0, rng
+            simple_rates, two_state_topology, ExposureProfile.constant(0.0), rng
         )
         result = sim.simulate(
             np.array([50.0, 10.0]), t_max=72, t_record=np.linspace(0, 72, 100)
@@ -42,7 +43,7 @@ class TestGillespieSimulator:
             },
         )
         sim = GillespieSimulator(
-            rate_set, two_state_topology, lambda t: 0.0, rng
+            rate_set, two_state_topology, ExposureProfile.constant(0.0), rng
         )
         t_record = np.linspace(0, 48, 25)
         ensemble = sim.simulate_ensemble(
@@ -67,7 +68,7 @@ class TestGillespieSimulator:
             death_base={CellType.P: 0.1, CellType.Q: 0.05},
         )
         sim = GillespieSimulator(
-            rate_set, two_state_topology, lambda t: 0.0, rng
+            rate_set, two_state_topology, ExposureProfile.constant(0.0), rng
         )
         t_record = np.linspace(0, 100, 50)
         ensemble = sim.simulate_ensemble(
@@ -81,7 +82,7 @@ class TestGillespieSimulator:
     def test_ensemble_statistics(self, two_state_topology, simple_rates, rng):
         """Ensemble result provides valid mean, std, and variance."""
         sim = GillespieSimulator(
-            simple_rates, two_state_topology, lambda t: 0.0, rng
+            simple_rates, two_state_topology, ExposureProfile.constant(0.0), rng
         )
         t_record = np.linspace(0, 24, 13)
         ensemble = sim.simulate_ensemble(

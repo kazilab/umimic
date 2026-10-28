@@ -96,6 +96,15 @@ class TestExperimentConfig:
         with pytest.raises(ValidationError, match="f_oral"):
             ExperimentConfig(pk={"f_oral": 1.5})
 
+    def test_oral_dosing_requires_an_absorption_rate(self):
+        oral = {"type": "oral", "dose_amount": 10.0, "interval": 24.0, "n_doses": 2}
+        with pytest.raises(ValidationError, match="pk.ka"):
+            ExperimentConfig(pk={"model": "one_compartment"}, dosing=oral)
+        with pytest.raises(ValidationError, match="pk.ka"):
+            ExperimentConfig(pk={"model": "two_compartment"}, dosing=oral)
+        config = ExperimentConfig(pk={"model": "one_compartment", "ka": 1.0}, dosing=oral)
+        assert config.pk.ka == 1.0
+
     def test_signaling_rejects_non_finite_values(self):
         with pytest.raises(
             ValidationError, match="Signaling state/parameter values must be finite"
@@ -175,3 +184,25 @@ class TestExperimentConfig:
         assert "logistic" in ranges
         assert "target_overrides" in ranges
         assert ranges["hill"]["ec50"][0] > 0
+
+
+
+def test_priors_accept_any_model_parameter_and_reach_the_fit():
+    from scipy import stats
+
+    from umimic.inference.priors import PriorSpec
+    from umimic.pipeline.experiment import Experiment
+
+    config = ExperimentConfig(priors={"u_PQ": {"dist_param_scale": 0.02, "dist_param_s": 0.4}})
+    spec = PriorSpec.default_invitro()
+    Experiment(config)._apply_prior_overrides(spec)
+    prior = spec.distributions["u_PQ"]
+    assert prior.median() == pytest.approx(0.02)
+    assert prior.dist.name == stats.lognorm.name
+
+
+def test_priors_reject_unknown_parameters():
+    with pytest.raises(ValidationError, match="no model parameter"):
+        ExperimentConfig(priors={"b0_typo": {"dist_param_scale": 0.02}})
+    with pytest.raises(ValidationError, match="dist_param_scale"):
+        ExperimentConfig(priors={"u_PQ": {"scale": 0.02}})

@@ -6,6 +6,7 @@ import pytest
 from umimic.dynamics.rates import RateSet
 from umimic.dynamics.states import CellType, ModelTopology
 from umimic.dynamics.gillespie import GillespieSimulator
+from umimic.pk.exposure import ExposureProfile
 from umimic.inference.clonal import (
     clone_size_logpmf,
     clone_size_params,
@@ -65,7 +66,7 @@ class TestCloneSizeLaw:
         )
         rates = RateSet(birth_base=b, death_base={CellType.P: d}, transition_base={})
         ens = GillespieSimulator(
-            rates, topology, lambda x: 0.0, rng=np.random.default_rng(7)
+            rates, topology, ExposureProfile.constant(0.0), rng=np.random.default_rng(7)
         ).simulate_ensemble(np.array([1.0]), t, np.array([0.0, t]), n_trajectories=3000)
         gillespie = np.array([tr["P"][-1] for tr in ens.trajectories])
 
@@ -120,3 +121,22 @@ class TestFitCloneSizes:
         assert fit.n_clones == 5000
         assert fit.n_extinct == int(np.sum(sizes == 0))
         assert 0.0 < fit.extinction_prob < 1.0
+
+
+def test_histogram_fit_matches_the_per_clone_fit():
+    from umimic.inference.clonal import fit_clone_size_histogram, fit_clone_sizes, sample_clone_sizes
+
+    sizes = sample_clone_sizes(0.05, 0.02, 48.0, 3000, np.random.default_rng(3))
+    per_clone = fit_clone_sizes(sizes, 48.0, detection=0.9)
+    unique, counts = np.unique(sizes, return_counts=True)
+    histogram = fit_clone_size_histogram(unique, counts, 48.0, detection=0.9)
+    assert histogram.birth_rate == pytest.approx(per_clone.birth_rate, rel=1e-9)
+    assert histogram.death_rate == pytest.approx(per_clone.death_rate, rel=1e-9)
+    assert (histogram.n_clones, histogram.n_extinct) == (per_clone.n_clones, per_clone.n_extinct)
+
+
+def test_observed_pmf_sums_to_one_with_imperfect_detection():
+    from umimic.inference.clonal import observed_clone_size_pmf
+
+    total = observed_clone_size_pmf(np.arange(0, 5000), 0.05, 0.02, 48.0, detection=0.7).sum()
+    assert total == pytest.approx(1.0, abs=1e-9)

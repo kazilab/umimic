@@ -25,6 +25,7 @@ from umimic.observations.multimodal import MultimodalObservation
 from umimic.observations.tumor_volume import TumorVolumeObservation
 from umimic.pk.compartment import OneCompartmentPK, TwoCompartmentPK
 from umimic.pk.dosing import Dose, DosingSchedule
+from umimic.pk.exposure import ExposureProfile
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +243,7 @@ def test_ssa_ensemble_matches_analytical_birth_death_moments():
     b, d, N0 = 0.08, 0.03, 200.0
     t_rec = np.array([0.0, 5.0, 10.0, 20.0])
 
-    sim = GillespieSimulator(rates, topo, lambda t: 0.0, np.random.default_rng(7))
+    sim = GillespieSimulator(rates, topo, ExposureProfile.constant(0.0), np.random.default_rng(7))
     traj = np.array(
         [sim.simulate(np.array([N0]), 20.0, t_rec).populations["P"]
          for _ in range(1500)]
@@ -262,7 +263,7 @@ def test_ssa_selects_thinning_for_time_varying_exposure():
     rng = np.random.default_rng(0)
     t_rec = np.array([0.0, 10.0])
 
-    constant = GillespieSimulator(rates, topo, lambda t: 0.0, rng)
+    constant = GillespieSimulator(rates, topo, ExposureProfile.constant(0.0), rng)
     assert constant.simulate(np.array([100.0]), 10.0, t_rec).metadata[
         "method"
     ] == "gillespie:direct"

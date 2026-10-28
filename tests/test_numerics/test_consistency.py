@@ -305,7 +305,9 @@ def test_direct_method_is_not_exact_under_a_time_varying_exposure():
     )
     assert varying.metadata["exact"] is False
 
-    constant = _gillespie(lambda _t: 1.0, "direct").simulate(
+    from umimic.pk.exposure import ExposureProfile
+
+    constant = _gillespie(ExposureProfile.constant(1.0), "direct").simulate(
         np.array([50.0, 0.0]), t_max=5.0, t_record=np.array([0.0, 5.0])
     )
     assert constant.metadata["exact"] is True
