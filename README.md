@@ -84,6 +84,13 @@ umimic config suggest-coupling-ranges
 umimic config suggest-coupling-ranges --format yaml
 ```
 
+With `--config`, simulation uses the configured kinetics, solver, and PK dosing
+schedule. `--drug-type` explicitly overrides the mechanism while retaining the
+baseline rates. Without a configuration, `simulate` runs an ODE dose-response
+demonstration. Output includes `simulation.json`, the effective `config.yaml`,
+and figures. Command logs go to stderr and the run log file so JSON/YAML utility
+output can be redirected directly.
+
 ### Python API
 
 ```python
@@ -152,6 +159,10 @@ If `--log-file` is not provided, a timestamped log file is written to the
 command output directory. Logging uses a package-scoped logger (`umimic`) and
 does not interfere with other logging configuration.
 
+Inference result JSON includes the effective configuration, package version,
+seed, a fingerprint of the observations, and full MCMC arrays and traces when
+applicable. Keep the result file alongside the input data for reproducibility.
+
 ## Documentation
 
 Full documentation is available on Read the Docs. To build locally:
@@ -163,6 +174,9 @@ sphinx-build -b html docs docs/_build/html
 
 - [Quickstart](docs/quickstart.md)
 - [Configuration Reference](docs/configuration.md)
+- [Mathematical Model](docs/mathematical-model.md): the equations from drug
+  exposure to fitted parameters
+- [Scientific Assumptions](docs/scientific-assumptions.md)
 - [API Reference](docs/api.md)
 - [Read the Docs Setup](docs/readthedocs-github.md)
 - [PyPI Trusted Publishing](docs/pypi-trusted-publishing.md)

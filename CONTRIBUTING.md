@@ -9,7 +9,7 @@ get started.
 
 ```bash
 git clone https://github.com/kazilab/umimic.git
-cd umimic/script
+cd umimic
 pip install -e ".[dev,inference]"
 ```
 
@@ -22,7 +22,7 @@ pytest
 ## Project Structure
 
 ```
-script/
+umimic/              # repository root
   umimic/
     pipeline/       # CLI, config, experiment orchestration
     dynamics/       # ODE, Gillespie, tau-leaping simulation

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "umimic"
-version = "0.0.4"
+dynamic = ["version"]
 description = "Unified Mechanistic Inference from Multimodal Imaging and Counts"
 readme = "README.md"
 license = "MIT"
@@ -23,6 +23,7 @@ dependencies = [
     "pydantic>=2.0",
     "pyyaml>=6.0",
     "arviz>=0.17",
+    "pandas>=1.5",
 ]
 
 [project.optional-dependencies]
@@ -40,6 +41,10 @@ dev = [
     "pytest-cov>=4.1",
     "ruff>=0.1",
     "mypy>=1.7",
+    "emcee>=3.1,<4.0",
+    "pip>=23.1",
+    "setuptools>=68.0",
+    "wheel",
 ]
 all = ["umimic[inference,docs,dev]"]
 
@@ -50,6 +55,13 @@ umimic = "umimic.pipeline.runner:main"
 where = ["."]
 include = ["umimic*"]
 exclude = ["tests*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "umimic.__version__"}
+
+[tool.setuptools.package-data]
+"umimic" = ["**/*.md"]
+"umimic.data.public" = ["README.md", "catalog/*.json", "*/*.csv", "*/*.csv.xz", "*/*.xlsx", "*/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

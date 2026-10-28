@@ -5,7 +5,217 @@ All notable changes to U-MIMIC will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.0.4]
+## [Unreleased]
+
+### Added
+
+- `docs/mathematical-model.md`: the whole calculation in equations, from
+  exposure and rate laws through the moment equations, observation laws and
+  likelihood to each estimator, clone sizes, transfer priors and the
+  identifiability scores, with the code that implements each step. The docs
+  build now enables MyST `dollarmath`, so the equations on the scientific
+  assumptions page render as well.
+- GitHub Actions workflows `tests.yml`, `docs.yml`, `release-smoke.yml` and
+  `publish-pypi.yml`, the ones the README badges and
+  `docs/pypi-trusted-publishing.md` name. The source export had dropped them,
+  so the release test for the publishing workflow was skipped.
+- Workbench user handbook at `/handbook`, linked from the header and footer:
+  projects and links, table layout, examples, every step's settings, fitting
+  modes and their costs, job states, results, export and reproduction,
+  scientific limits and troubleshooting. It shows the server's own limits from
+  `/api/manifest`, and a test keeps its stated defaults equal to the server's.
+- `web/` workbench: a guest-first website for simulation, CSV and spreadsheet
+  import, public-dataset import, versioned preparation, synthetic plates, and
+  queued multi-start MLE. Owner, view, and edit links replace the login wall.
+  Runs archive the effective config, dataset fingerprint, and result JSON the
+  CLI already writes. Kalman, particle, clonal, transfer, comparison, and
+  design workflows stay on the Python API until a later adapter.
+- Workbench project bundles (schema 3) carry each run's spec, and import
+  restores finished simulate, generate and fit runs, their files, and table
+  lineage. Restored runs are marked imported; their summaries are rebuilt
+  from the run files rather than taken from `project.json`.
+- Workbench public datasets import as subsets: each table names the metadata
+  it can be narrowed by (cell line, drug, compound, panel, population, plate,
+  seeding, treatment group), and the Data step shows series counts before
+  loading. BESTDR, PhenoPop, Hafner GR and NCI-60 exceed the default
+  200-series limit and could not be imported before.
+- `umimic.data.public_datasets.nci60_index()` lists the NSC, cell line and
+  panel of every NCI-60 series without building series, so a filtered load
+  can be counted first.
+- Resumable MCMC: `umimic.inference.checkpoint.MCMCCheckpoint` saves an emcee
+  run every N steps (a NumPy archive, read without pickle), and
+  `MCMCSampler.sample(checkpoint=..., progress=...)` resumes a matching run
+  exactly, with the same draws as an uninterrupted run. `Experiment.fit`
+  passes both through for `mode: mcmc` and keeps them out of the archived
+  options. Runs without a checkpoint draw exactly as before.
+- Workbench MCMC fits: inference mode, walkers, warmup and draws in the
+  guided form; cost limits (`MCMC_MAX_WALKERS`, `MCMC_MAX_EVALUATIONS`)
+  checked before queueing; progress in the job list; automatic resume from
+  the checkpoint after a worker stops; posterior summaries with 95%
+  intervals, ESS, R-hat and plain-language warnings; walker trace and
+  posterior plots. MCMC is on by default (`MCMC_ENABLED`), and the workbench
+  now depends on `umimic[inference]` for emcee.
+- `MCMCCheckpoint(strict=True)` raises `CheckpointMismatch` when a saved run
+  exists but cannot continue this one, instead of restarting quietly, and
+  `MCMCCheckpoint.peek()` reports a saved run's phase and step.
+- `Experiment.filter(data, parameters=None)` runs the extended Kalman filter
+  on each series under the experiment's model, and
+  `ModelLikelihood.kalman_filter(params, series)` does so for one series with
+  the same rates, exposure, initial state, anchor and observation models as
+  the batch likelihood.
+- Workbench `filter` runs (RunSpec schema 3): the extended Kalman filter at
+  the configured model's parameters or a finished fit's estimates, refused
+  before queueing for marker fractions; filtered viable cells and states,
+  per-series filter log-likelihood, and `filter.json` in the run zip. Filter
+  runs export and import like other runs.
+- Particle filter results report `viable_means`/`viable_vars`, per-time
+  `ess` and `n_events`, and accept a `max_total_events` budget
+  (`ParticleBudgetExceeded`). `ModelLikelihood.particle_filter` and
+  `Experiment.particle_filter` run it on the experiment's model, seeded from
+  the configuration.
+- `inference.mode: pmcmc` runs particle MCMC from `Experiment.fit` (with
+  `n_particles` and the new `proposal_scale`), starting at the prior medians.
+  `ParticleMCMC.from_likelihood` evaluates through `ModelLikelihood`, so the
+  chain targets the configured model -- base rates, PK exposure, every series
+  -- where the direct constructor rebuilt rates from the sampled parameters
+  alone, assumed a constant exposure and took one series. `backend: particle`
+  is accepted with `mode: pmcmc`; `n_particles` is no longer reported as inert
+  there.
+- Workbench: the particle filter as a second filter method (marker fractions
+  and detection limits included), and particle MCMC as a third inference
+  mode, each with a cost estimate from the table's counts before queueing and
+  a hard event budget while running (`PARTICLE_MAX_PARTICLES`,
+  `PARTICLE_MAX_EVENTS`, `PMCMC_MAX_EVENTS`).
+- `inference.mode: hierarchical` with `random_effects` runs the hierarchical
+  model from `Experiment.fit`: each series is a group, the listed parameters
+  vary by series, the rest are shared. `HierarchicalModel` takes
+  `exposure_fn` and `base_rate_set` (each group's likelihood ignored the
+  configured rates and PK before), and `fit(checkpoint=, progress=)` saves and
+  resumes exactly like MCMC.
+- `fit_clone_size_histogram` fits clone sizes given as a histogram (the
+  likelihood needs only its sufficient statistics), and
+  `observed_clone_size_pmf` gives the observed-size law with imperfect
+  detection.
+- Workbench hierarchical fits (guided form: which parameters vary by series;
+  size checked against the MCMC limits before queueing; filter runs use the
+  population medians) and clone-size fits (`POST .../jobs/clonal` with a
+  per-clone or histogram CSV, elapsed time and detection; observed against
+  fitted sizes; `repeat.py` in the run zip). Both export and import.
+- Workbench password reset by emailed link (`POST /api/account/password-reset`
+  and `/confirm`, "Forgot your password?" in the interface): single-use,
+  hashed, time-limited tokens; the same reply whether or not an account
+  exists; per-address and per-IP limits; other devices signed out on reset.
+  SMTP settings (`SMTP_*`, `PUBLIC_BASE_URL`) come from the environment only;
+  `web/.env.example` lists them, and the SMTP password is kept out of logs and
+  the settings' text.
+- Workbench release hardening: an authorization matrix test that reads every
+  project route and checks no-link, view-link and edit-link access against
+  the role it requires; a real worker child process running a job and a real
+  crashed child recorded as a failure; deletion of every run kind with its
+  checkpoint and progress files; a full-size (200 x 500) table upload timed;
+  housekeeping removes old reset links; `Permissions-Policy`, HSTS when
+  hosted, and a report-only Content-Security-Policy.
+- Simulations with signaling report the pathway trajectory
+  (`metadata["signaling"]["trajectory"]`: node activity at the observation
+  times).
+- `priors` accepts a prior for any model parameter, not only the five with
+  defaults (unknown names were silently dropped before; they are now
+  rejected).
+- `TransferLearning(max_sigma=2.0)` skips a parameter the in vitro data
+  barely constrain instead of turning it into a lognormal prior with an
+  extreme spread (an SE 20 times the estimate gave a prior mean near 1e87);
+  the reason is recorded.
+- `umimic.inference.design.evaluate_design` reports the expected precision
+  of a design -- from the Fisher information of its noise-free data at given
+  parameter values -- with each parameter constrained, confounded (only in
+  combination) or not constrained; observation-noise parameters are held
+  fixed. `Experiment.parameter_values()` gives the configured model's values
+  of its parameter set, and `likelihood_identifiability` now returns the
+  information matrix.
+- Workbench signaling in the guided form (drug direction, coupling targets,
+  response function) with a pathway-activity plot; transfer of in-vitro fit
+  results as priors of an in-vivo project (`POST /api/projects/{id}/transfer`,
+  preview or apply, recorded as a `transfer` run); and `design` runs ranking
+  2 to 6 candidate designs (concentrations, duration, interval, replicates)
+  by expected precision.
+- Workbench comparison (a Compare step and
+  `GET /api/projects/{id}/compare?jobs=...`): two to eight finished runs side
+  by side -- the configuration settings that differ, parameters with their
+  uncertainty, fit statistics with delta-AIC only when the fits used the same
+  table, and simulated trajectories overlaid.
+- Workbench parameter sweeps (`sweep` runs): simulate the model at every
+  combination of one or two settings, each over 2 to 20 values, with every
+  combination validated before queueing (`SWEEP_MAX_COMBINATIONS`, 50);
+  final viable cells and growth per combination, a line plot or heatmap, and
+  `sweep.json` in the run zip.
+- Workbench: an MCMC fit stopped by the time limit, or out of automatic
+  retries, keeps its saved state and can be resumed
+  (`POST /api/projects/{id}/jobs/{job}/resume`, a Resume button in the job
+  list). The work stays within the run's evaluation limit.
+
+### Fixed
+
+- The observations notes and the `CellCountObservation.log_likelihood`
+  docstring said moment mode scores counts with a Gaussian. It uses a negative
+  binomial whose size is lowered to carry the process variance, and a Gaussian
+  only below the Poisson floor or on request; the documentation now says so.
+- Stochastic runs that hit the Gillespie event limit are no longer reported as
+  complete. The workbench fails such a simulation and publishes nothing,
+  synthetic-data generation raises instead of sampling the frozen tail, and
+  tau-leaping now reports `truncated` (and `t_reached`) when its SSA tail stops.
+- The workbench counts observation-grid points before building the grid and
+  refuses runs with more time points per series than `MAX_TIMEPOINTS_PER_SERIES`,
+  including explicit `observation_times` and configs saved before the limit.
+- Invalid guided-form values return a 422 field error instead of a 500.
+- A failed MCMC checkpoint save no longer ends the run. On Windows a virus
+  scanner or indexer can briefly hold a just-written file, which made the
+  atomic replace fail and took the whole fit down. Saves are retried briefly;
+  if one still fails the run continues from memory, the previous checkpoint
+  stays valid, and `checkpoint_save_failures` counts the misses. The
+  workbench retries its own atomic renames the same way and treats an
+  unwritable progress note as non-fatal.
+- `dosing.type: oral` now requires `pk.ka` when the configuration is
+  validated; before, it failed only once a simulation started. The workbench
+  form has absorption rate and bioavailability fields for oral dosing.
+- The workbench downloads a new owner link's recovery card before saving the
+  link in browser storage, and shows the link on the page when storage is off
+  or full, for new, imported and example projects and owner-link replacement.
+  Previously a storage failure lost the link.
+- Workbench tests resolve `tests.helpers` to their own package when the
+  repository root is also on `sys.path`.
+- Preserve configured PK exposure and fixed rates during fitting, and align
+  replicate trajectories to their actual initial-observation times.
+- Require explicitly constant exposure for ODE acceleration. Integrate dosing
+  boundaries and wait through inactive stochastic intervals before treatment.
+- Preserve censoring likelihoods in multimodal fits, custom observation-noise
+  parameters, singleton observations, and declining clone-size distributions.
+- Honor configured rates, solver and PK in the CLI. Save numerical simulation
+  output and effective configuration; keep command logs off JSON/YAML stdout.
+- Bound observation schedules by the study horizon, support explicit schedules,
+  dispatch in-vivo tau-leaping correctly, and keep signaling independent of
+  measurement times. Allocate fractional initial mixtures to whole cells.
+- Round-trip all CSV modalities, group and replicate identities, concentrations,
+  missing values and compressed files without depending on pandas parsing.
+- Include public datasets and metadata in built distributions, normalize mixed
+  PhenoPop aliases, honor external data-cache paths, and use one version source.
+- Archive effective inference configuration, seed, observation fingerprint and
+  full posterior arrays. Correct quickstart and publishing instructions.
+
+### Compatibility notes
+
+- A configuration with `dosing.type: oral` and no `pk.ka` is now a validation
+  error. It could not be simulated before either.
+- Custom exposure callbacks should expose `is_constant = True` only when
+  constant, and provide `breakpoints(start, end)` for treatment discontinuities.
+  `ExposureProfile` supplies this information automatically.
+- Gaussian EKF updates explicitly reject censored observations; use the batch
+  likelihood or a particle filter for those measurements. A non-positive
+  reading with no detection limit raises the observation model's own error
+  instead, and a non-finite state mean marks the filter diverged (-inf).
+
+## [0.0.4] - not yet released
+
+Not yet published: PyPI's latest release is 0.0.2. There was no 0.0.3.
 
 > **Results from this release will differ from 0.0.2.** Several numerical
 > defects were corrected. Any quantitative result produced with 0.0.2 or
@@ -316,6 +526,16 @@ families corrected elsewhere in this release:
   `dynamics.transitions`) were emitted as `!!python/tuple`, which
   `yaml.safe_load` refuses to read, so an affected configuration saved
   cleanly and then failed to load.
+- CLI logging now uses a package-scoped logger (`umimic`) instead of overwriting
+  the root logger via `logging.basicConfig(force=True)`.
+- Lambda closures in likelihood and experiment modules now use default-argument
+  binding to avoid late-binding capture bugs in loops.
+- `load_config()` validates file existence and YAML content before parsing,
+  with actionable error messages.
+- Public dataset loader (`_find_data_dir`) now lists available datasets and
+  suggests the correct download command on failure.
+- `UMIMIC_DATA_ROOT` env var now warns and falls back gracefully when pointing
+  to a non-existent directory.
 
 ### Consistency and API honesty
 
@@ -398,26 +618,8 @@ families corrected elsewhere in this release:
   invariance, birth-death moments, tau-leaping convergence, and configuration
   fidelity.
 - `LICENSE` (MIT).
-
-## [Unreleased]
-
-### Added
 - CHANGELOG.md and CONTRIBUTING.md for project governance.
 - Expanded Sphinx documentation: quickstart, API reference, configuration guide.
-
-### Fixed
-- CLI logging now uses a package-scoped logger (`umimic`) instead of overwriting
-  the root logger via `logging.basicConfig(force=True)`.
-- Dashboard command no longer relies on a single hard-coded path; searches
-  multiple candidate locations and reports clear errors.
-- Lambda closures in likelihood and experiment modules now use default-argument
-  binding to avoid late-binding capture bugs in loops.
-- `load_config()` validates file existence and YAML content before parsing,
-  with actionable error messages.
-- Public dataset loader (`_find_data_dir`) now lists available datasets and
-  suggests the correct download command on failure.
-- `UMIMIC_DATA_ROOT` env var now warns and falls back gracefully when pointing
-  to a non-existent directory.
 
 ### Improved
 - CLI exception handling catches specific error types (`FileNotFoundError`,
