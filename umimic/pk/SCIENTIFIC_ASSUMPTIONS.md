@@ -147,8 +147,13 @@ exposure.precompute(np.linspace(0, t_max, n))
 
 then uses **linear interpolation** on that grid. Callers must put dose and
 infusion breakpoints on the grid if peak shape matters; inter-knot peaks are
-under-resolved. Outside the grid, values are clamped to the endpoints.
+under-resolved. Outside the grid, concentrations are solved from the PK model exactly.
 `clear_cache()` restores exact solves.
+
+`breakpoints(start, end)` exposes dose times, infusion stops, and cache knots
+to population solvers. These boundaries prevent a solver from stepping across
+an entire delayed treatment while the population is stationary. Constancy is
+explicit (`is_constant`); it is never inferred from a finite set of samples.
 
 There is no silent automatic cache: approximation is opt-in.
 

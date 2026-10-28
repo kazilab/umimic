@@ -32,6 +32,8 @@ from collections import Counter
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
+from umimic.data.public_datasets import _resolve_default_data_root
+
 NS = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
 FIELDS = [
     "hours",
@@ -223,7 +225,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--xlsx",
         type=Path,
-        default=Path(__file__).resolve().parent / "tshs_tumor" / "tumorgrowth.xlsx",
+        default=_resolve_default_data_root() / "tshs_tumor" / "tumorgrowth.xlsx",
         help="Path to tumorgrowth.xlsx",
     )
     parser.add_argument(

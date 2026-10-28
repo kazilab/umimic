@@ -227,10 +227,12 @@ class CellCountObservation(TopologyAwareObservation, ObservationModel):
         """Log-likelihood for cell count observation.
 
         When process_variance is provided (from LNA moment equations), uses a
-        Gaussian likelihood that incorporates the mechanistic variance signature.
-        This is critical for identifiability: the process variance depends on
-        (b + d) while the mean depends on (b - d), enabling separation of
-        birth and death rates from count data alone.
+        NegBin whose size is lowered to carry Var = Var_process + mu + mu^2/phi
+        (see `_inflated_phi`), or a Gaussian below the Poisson floor or with
+        ``moment_family="gaussian"``. The process variance depends on (b + d)
+        while the mean depends on (b - d), so in principle it separates birth
+        from death; at realistic counting noise it is usually too small a
+        share of the total to do so (inference SCIENTIFIC_ASSUMPTIONS.md, 2a).
 
         When process_variance is None, falls back to NegBin(mu, phi).
         """

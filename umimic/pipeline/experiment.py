@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 
 from typing import Any, Callable, Sequence
 
 import numpy as np
 from scipy import stats
-from scipy.integrate import solve_ivp
 
 from umimic.pipeline.config import ExperimentConfig
 from umimic.dynamics.states import CellType, ModelTopology
@@ -16,6 +16,8 @@ from umimic.dynamics.rates import EmaxHill, HillFoldChange, RateSet
 from umimic.dynamics.ode_system import CellDynamicsODE
 from umimic.dynamics.gillespie import GillespieSimulator
 from umimic.dynamics.tau_leaping import TauLeapingSimulator
+from umimic.dynamics.initialization import integer_initial_state
+from umimic.dynamics._integration import solve_ivp_exposure
 from umimic.pk.dosing import DosingSchedule
 from umimic.pk.exposure import ExposureProfile
 from umimic.observations.cell_counts import CellCountObservation
@@ -26,12 +28,15 @@ from umimic.observations.multimodal import MultimodalObservation
 from umimic.inference.likelihood import PARAMETER_SETS, ModelLikelihood
 from umimic.inference.mle import MLEstimator
 from umimic.inference.mcmc import MCMCSampler
+from umimic.inference.smc import ParticleMCMC
+from umimic.inference.hierarchical import HierarchicalModel
 from umimic.inference.priors import PriorSpec
 from umimic.data.schemas import TimeSeriesData, ExperimentalDataset
 from umimic.data.synthetic import SyntheticDataGenerator
 from umimic.signaling.models import ToyMapkAktNetwork
 from umimic.signaling.network import SignalingNetwork
-from umimic.types import SimulationResult, InferenceResult
+from umimic.types import FilterResult, InferenceResult, SimulationResult
+from umimic.time_grid import observation_grid, validate_observation_times
 
 LOGGER = logging.getLogger(__name__)
 
@@ -365,16 +370,33 @@ class Experiment:
         method = method or self.config.simulation.method
 
         sc = self.config.simulation
-        t_eval = np.arange(0, sc.t_max + sc.dt_obs, sc.dt_obs)
+        t_eval = self._observation_times()
         y0 = self._initial_state_vector(sc.initial_cells, rs)
 
+        if method not in ("ode", "gillespie", "tau_leaping"):
+            raise ValueError(f"Unknown method: {method}")
+
         if concentrations is not None:
-            # Dose-response simulation. solve_dose_response takes no rate
-            # multiplier, so coupling would be silently dropped here exactly as
-            # it would be in the stochastic branches below.
             self._reject_unsupported_signaling("dose_response")
-            ode = CellDynamicsODE(rs, self.topology, lambda t, _c=0.0: _c)
-            return ode.solve_dose_response(y0, (0, sc.t_max), concentrations, t_eval)
+            results = {}
+            for concentration in concentrations:
+                if not np.isfinite(concentration) or concentration < 0:
+                    raise ValueError("Concentrations must be finite and non-negative")
+                results[float(concentration)] = self._simulate_trajectory(
+                    rs, method, ExposureProfile.constant(float(concentration)), y0, t_eval
+                )
+            return results
+
+        return self._simulate_trajectory(rs, method, self.exposure, y0, t_eval)
+
+    def _observation_times(self) -> np.ndarray:
+        sc = self.config.simulation
+        if sc.observation_times is not None:
+            return validate_observation_times(sc.observation_times, sc.t_max)
+        return observation_grid(sc.t_max, sc.dt_obs)
+
+    def _simulate_trajectory(self, rs, method, exposure, y0, t_eval):
+        sc = self.config.simulation
 
         if method == "ode":
             rate_multiplier_fn: Callable[[float, str], float] | None = None
@@ -387,7 +409,7 @@ class Experiment:
             ode = CellDynamicsODE(
                 rs,
                 self.topology,
-                self.exposure,
+                exposure,
                 rate_multiplier_fn=rate_multiplier_fn,
             )
             result = ode.solve(y0, (0, sc.t_max), t_eval)
@@ -396,14 +418,14 @@ class Experiment:
             return result
         elif method == "gillespie":
             self._reject_unsupported_signaling(method)
-            sim = GillespieSimulator(rs, self.topology, self.exposure, self.rng)
-            return sim.simulate(y0, sc.t_max, t_eval)
+            sim = GillespieSimulator(rs, self.topology, exposure, self.rng)
+            return sim.simulate(integer_initial_state(y0, self.rng), sc.t_max, t_eval)
         elif method == "tau_leaping":
             self._reject_unsupported_signaling(method)
             sim = TauLeapingSimulator(
-                rs, self.topology, self.exposure, rng=self.rng
+                rs, self.topology, exposure, rng=self.rng
             )
-            return sim.simulate(y0, sc.t_max, t_eval)
+            return sim.simulate(integer_initial_state(y0, self.rng), sc.t_max, t_eval)
         else:
             raise ValueError(f"Unknown method: {method}")
 
@@ -458,17 +480,16 @@ class Experiment:
             return None
 
         network, y0 = signaling
-        t_span = (float(t_eval[0]), float(t_eval[-1]))
-        if t_span[1] < t_span[0]:
-            raise ValueError(
-                f"Signaling integration requires t_eval with non-decreasing "
-                f"span, got {t_span}."
-            )
-        sol = solve_ivp(
+        # Observation times select output only. Pathway initial conditions
+        # belong to study time zero, even if the first measurement is later
+        # or the schedule contains just one observation.
+        t_span = (0.0, float(self.config.simulation.t_max))
+        sol = solve_ivp_exposure(
             lambda t, y: network.rhs(t, y, float(self.exposure(t))),
             t_span=t_span,
             y0=y0,
-            t_eval=t_eval,
+            exposure_fn=self.exposure,
+            dense_output=True,
             method="RK45",
             rtol=1e-6,
             atol=1e-8,
@@ -480,17 +501,6 @@ class Experiment:
             )
 
         idx_map = {name: i for i, name in enumerate(network.node_names)}
-        # Clip numerical undershoot so activity used in coupling stays in [0, 1].
-        mapk = (
-            np.clip(sol.y[idx_map["mapk"]], 0.0, 1.0)
-            if "mapk" in idx_map
-            else np.zeros_like(sol.t)
-        )
-        akt = (
-            np.clip(sol.y[idx_map["akt"]], 0.0, 1.0)
-            if "akt" in idx_map
-            else np.zeros_like(sol.t)
-        )
 
         cparams = self.config.coupling.parameters
         max_effect_by_target = self.config.coupling.max_effect_by_target
@@ -510,7 +520,6 @@ class Experiment:
         hill = max(float(cparams.get("hill", 1.0)), 1e-6)
         logistic_k = float(cparams.get("k", 1.0))
         logistic_center = float(cparams.get("center", 0.5))
-        activity = np.clip(w_mapk * mapk + w_akt * akt, 0.0, None)
         targets = set(self.config.coupling.targets)
 
         def applies_to_key(key: str) -> bool:
@@ -558,7 +567,13 @@ class Experiment:
         def signaling_rate_multiplier(t: float, key: str) -> float:
             if not self.config.coupling.enabled or not applies_to_key(key):
                 return 1.0
-            sig = float(np.interp(t, sol.t, activity))
+            pathway = sol.sol(float(t))
+            # Evaluate the integrated pathway directly. Interpolating only
+            # measurement knots made the cell dynamics depend on which times
+            # the user requested, and held activity fixed outside that grid.
+            mapk = float(np.clip(pathway[idx_map["mapk"]], 0, 1)) if "mapk" in idx_map else 0.0
+            akt = float(np.clip(pathway[idx_map["akt"]], 0, 1)) if "akt" in idx_map else 0.0
+            sig = max(w_mapk * mapk + w_akt * akt, 0.0)
             effect = normalized_effect(max(sig, 0.0), key)
             # High activity -> rates above RateSet baseline; low activity -> 1.
             return max(0.0, 1.0 + resolve_max_effect(key) * effect)
@@ -581,6 +596,15 @@ class Experiment:
             "k_by_target": dict(k_by_target),
             "center_by_target": dict(center_by_target),
             "nodes": network.node_names,
+            # Pathway activity at the observation times, the curve the rate
+            # coupling reads.
+            "trajectory": {
+                "times": [float(t) for t in t_eval],
+                **{
+                    name: [float(v) for v in np.clip(sol.sol(t_eval)[i], 0.0, 1.0)]
+                    for i, name in enumerate(network.node_names)
+                },
+            },
         }
         return signaling_rate_multiplier, meta
 
@@ -612,7 +636,7 @@ class Experiment:
         sc = self.config.simulation
         concentrations = self.config.dosing.concentrations
 
-        if self.config.context == "in_vitro":
+        if self.config.context == "in_vitro" and self.config.pk.model == "none":
             y0 = self._initial_state_vector(sc.initial_cells, rs)
             return gen.generate_invitro_plate(
                 initial_cells=y0,
@@ -621,17 +645,21 @@ class Experiment:
                 t_max=sc.t_max,
                 dt_obs=sc.dt_obs,
                 method=sc.method,
+                obs_times=self._observation_times(),
             )
         else:
             y0 = self._initial_state_vector(sc.initial_cells, rs)
-            return gen.generate_invivo_cohort(
+            dataset = gen.generate_invivo_cohort(
                 initial_cells=y0,
                 exposure_fn=self.exposure,
                 n_animals=sc.n_replicates,
                 t_max=sc.t_max,
                 modalities=self.config.observations.modalities,
                 method=sc.method,
+                obs_times=self._observation_times(),
             )
+            dataset.context = self.config.context
+            return dataset
 
     def _initial_state_vector(
         self, initial_cells: float, rate_set: RateSet | None = None
@@ -744,6 +772,152 @@ class Experiment:
             else:
                 spec.add(name, stats.lognorm(s=s, scale=scale))
 
+    @staticmethod
+    def _series_list(data) -> list[TimeSeriesData]:
+        if isinstance(data, ExperimentalDataset):
+            return list(data.series)
+        if isinstance(data, list):
+            return data
+        return [data]
+
+    def _with_initial_cells(self, data_list: list[TimeSeriesData]) -> list[TimeSeriesData]:
+        """Calibrated non-count modalities still need a cell-scale initial
+        condition. Preserve a series override without modifying caller data."""
+        return [
+            replace(series, metadata={
+                "initial_cells": self.config.simulation.initial_cells,
+                **series.metadata,
+            })
+            for series in data_list
+        ]
+
+    def parameter_values(self) -> dict[str, float]:
+        """The configured model's value of each parameter in its parameter set.
+
+        The inverse of how a likelihood builds rates from parameters, so
+        ``ModelLikelihood._build_rate_set(experiment.parameter_values())``
+        reproduces the configured rates. Useful as an operating point -- a
+        start for a fit, or where to evaluate a design -- when no fit exists.
+        """
+        rates = self.rate_set
+        obs = self.config.observations
+        P, Q, R = CellType.P, CellType.Q, CellType.R
+
+        def emax(modulator) -> float:
+            return float(modulator.emax) if isinstance(modulator, EmaxHill) else 0.0
+
+        death_p = rates.death_modulation.get(P)
+        birth = rates.birth_modulation
+        dynamics = self.config.dynamics
+        known: dict[str, Callable[[], float]] = {
+            "b0": lambda: float(rates.birth_base),
+            "b0_Q": lambda: float(rates.birth_base_by_state.get(Q, rates.birth_base)),
+            "b0_R": lambda: float(rates.birth_base_by_state.get(R, rates.birth_base)),
+            "d0_P": lambda: float(rates.death_base.get(P, 0.0)),
+            "d0_Q": lambda: float(rates.death_base.get(Q, 0.0)),
+            "d0_R": lambda: float(rates.death_base.get(R, 0.0)),
+            "emax_death": lambda: emax(death_p),
+            "ec50_death": lambda: float(death_p.ec50) if isinstance(death_p, EmaxHill) else dynamics.ec50_death,
+            "hill_death": lambda: float(death_p.hill) if isinstance(death_p, EmaxHill) else dynamics.hill_death,
+            "emax_death_Q": lambda: emax(rates.death_modulation.get(Q)),
+            "emax_death_R": lambda: emax(rates.death_modulation.get(R)),
+            "emax_birth": lambda: emax(birth),
+            "ec50_birth": lambda: float(birth.ec50) if isinstance(birth, EmaxHill) else dynamics.ec50_birth,
+            "hill_birth": lambda: float(birth.hill) if isinstance(birth, EmaxHill) else dynamics.hill_birth,
+            "u_PQ": lambda: float(rates.transition_base.get((P, Q), 0.0)),
+            "u_QP": lambda: float(rates.transition_base.get((Q, P), 0.0)),
+            "u_PR": lambda: float(rates.transition_base.get((P, R), 0.0)),
+            "u_QR": lambda: float(rates.transition_base.get((Q, R), 0.0)),
+            "u_RQ": lambda: float(rates.transition_base.get((R, Q), 0.0)),
+            "induced_PQ": lambda: emax(rates.transition_induction.get((P, Q))),
+            "induced_QR": lambda: emax(rates.transition_induction.get((Q, R))),
+            "clearance_rate": lambda: float(rates.clearance_rate),
+            "overdispersion": lambda: float(obs.cell_count_overdispersion),
+            "sigma_log_bli": lambda: float(obs.bli_sigma_log),
+            "sigma_v": lambda: float(obs.volume_sigma),
+            "biomarker_precision": lambda: float(obs.biomarker_precision),
+        }
+        names = PARAMETER_SETS[self.config.inference.parameter_set]
+        missing = [name for name in names if name not in known]
+        if missing:
+            raise ValueError(f"No configured value is defined for parameter(s) {missing}.")
+        return {name: known[name]() for name in names}
+
+    def filter(
+        self,
+        data: TimeSeriesData | ExperimentalDataset,
+        parameters: dict[str, float] | None = None,
+    ) -> list[FilterResult]:
+        """Extended Kalman filter of each series under this experiment's model.
+
+        ``parameters`` overrides rate and observation parameters of the
+        configured parameter set by name -- for example a fit's estimates --
+        and omitted names keep their configured values. The filter propagates
+        the LNA moments whatever ``inference.forward_mode`` says. See
+        :meth:`ModelLikelihood.kalman_filter` for what it does not represent.
+
+        Returns:
+            One FilterResult per series, in order. Each starts at that
+            series' anchor (initial-state) time.
+        """
+        data_list = self._with_initial_cells(self._series_list(data))
+        self._reject_unsupported_signaling("filter")
+        likelihood = self._filter_likelihood(data_list)
+        params = dict(parameters or {})
+        return [likelihood.kalman_filter(params, series) for series in data_list]
+
+    def particle_filter(
+        self,
+        data: TimeSeriesData | ExperimentalDataset,
+        parameters: dict[str, float] | None = None,
+        n_particles: int = 500,
+        max_total_events: int | None = None,
+        progress: Callable[[str, int, int], None] | None = None,
+    ) -> list[dict]:
+        """Bootstrap particle filter of each series under this experiment's model.
+
+        Like :meth:`filter`, with exact stochastic propagation and every
+        observation model's own likelihood (see
+        :meth:`ModelLikelihood.particle_filter`). Seeded from ``config.seed``,
+        so a rerun gives the same estimates. ``max_total_events`` bounds the
+        events simulated across all series; ``progress`` is called as
+        ``progress("series", done, total)`` after each series.
+        """
+        from umimic.inference.smc import ParticleBudgetExceeded
+
+        data_list = self._with_initial_cells(self._series_list(data))
+        self._reject_unsupported_signaling("particle filter")
+        likelihood = self._filter_likelihood(data_list)
+        params = dict(parameters or {})
+        rng = np.random.default_rng(self.config.seed)
+        remaining = max_total_events
+        results = []
+        for index, series in enumerate(data_list):
+            try:
+                result = likelihood.particle_filter(
+                    params, series, n_particles=n_particles, rng=rng, max_total_events=remaining
+                )
+            except ParticleBudgetExceeded as exc:
+                raise ParticleBudgetExceeded(f"Series {index + 1} of {len(data_list)}: {exc}") from exc
+            if remaining is not None:
+                remaining -= result["n_events"]
+            results.append(result)
+            if progress is not None:
+                progress("series", index + 1, len(data_list))
+        return results
+
+    def _filter_likelihood(self, data_list: list[TimeSeriesData]) -> ModelLikelihood:
+        return ModelLikelihood(
+            topology=self.topology,
+            data=data_list,
+            mode="moment",
+            observation_model=self._likelihood_observation_model(data_list),
+            param_names=PARAMETER_SETS[self.config.inference.parameter_set],
+            initial_fractions=self.config.dynamics.initial_fractions,
+            exposure_fn=self.exposure if self.config.pk.model != "none" else None,
+            base_rate_set=self.rate_set,
+        )
+
     def fit(
         self,
         data: TimeSeriesData | ExperimentalDataset,
@@ -758,12 +932,12 @@ class Experiment:
         Returns:
             InferenceResult with parameter estimates.
         """
-        if isinstance(data, ExperimentalDataset):
-            data_list = data.series
-        elif isinstance(data, list):
-            data_list = data
-        else:
-            data_list = [data]
+        data_list = self._series_list(data)
+
+        from umimic.pipeline.results import dataset_fingerprint
+
+        data_sha256 = dataset_fingerprint(data_list)
+        data_list = self._with_initial_cells(data_list)
 
         ic = self.config.inference
         priors = {
@@ -794,19 +968,34 @@ class Experiment:
             observation_model=observation_model,
             param_names=PARAMETER_SETS[ic.parameter_set],
             initial_fractions=self.config.dynamics.initial_fractions,
+            exposure_fn=self.exposure if self.config.pk.model != "none" else None,
+            base_rate_set=self.rate_set,
         )
+
+        from umimic import __version__
+
+        metadata = {
+            "config": self.config.model_dump(mode="json"),
+            "umimic_version": __version__,
+            "seed": self.config.seed,
+            "data_sha256": data_sha256,
+        }
 
         if ic.mode == "mle":
             estimator = MLEstimator(
                 likelihood=likelihood,
                 priors=priors if ic.backend != "scipy" else None,
                 method="L-BFGS-B" if ic.backend == "scipy" else "Nelder-Mead",
+                seed=self.config.seed,
             )
-            mle_result = estimator.fit(n_restarts=ic.n_restarts)
+            fit_options = {"n_restarts": ic.n_restarts, **kwargs}
+            metadata["inference_options"] = fit_options
+            mle_result = estimator.fit(**fit_options)
             return InferenceResult(
                 method="mle",
                 mle=mle_result,
                 context=self.config.context,
+                metadata=metadata,
             )
 
         elif ic.mode == "mcmc":
@@ -816,16 +1005,94 @@ class Experiment:
                 # emcee is the only sampler left: pymc was withdrawn in 0.0.4
                 # and scipy, the default backend, has no sampler at all.
                 backend="emcee",
+                rng=self.config.seed,
             )
-            mcmc_result = sampler.sample(
-                n_samples=ic.n_samples,
-                n_chains=ic.n_chains,
-                n_warmup=ic.n_warmup,
-            )
+            # A checkpoint and a progress hook steer how the run executes, not
+            # what it computes, so they stay out of the archived options.
+            runtime = {key: kwargs.pop(key) for key in ("checkpoint", "progress") if key in kwargs}
+            sample_options = {
+                "n_samples": ic.n_samples,
+                "n_chains": ic.n_chains,
+                "n_warmup": ic.n_warmup,
+                **kwargs,
+            }
+            metadata["inference_options"] = sample_options
+            mcmc_result = sampler.sample(**sample_options, **runtime)
             return InferenceResult(
                 method="mcmc",
                 mcmc=mcmc_result,
                 context=self.config.context,
+                metadata=metadata,
+            )
+
+        elif ic.mode == "hierarchical":
+            # Each series is a group. Random effects vary by series around a
+            # population median; everything else in the parameter set is shared.
+            runtime = {key: kwargs.pop(key) for key in ("checkpoint", "progress") if key in kwargs}
+            model = HierarchicalModel(
+                dataset=ExperimentalDataset(series=data_list, context=self.config.context),
+                topology=self.topology,
+                shared_params=[name for name in likelihood.param_names if name not in ic.random_effects],
+                random_effect_params=list(ic.random_effects),
+                priors=priors,
+                observation_model=observation_model,
+                mode=ic.forward_mode,
+                rng=self.config.seed,
+                initial_fractions=self.config.dynamics.initial_fractions,
+                exposure_fn=self.exposure if self.config.pk.model != "none" else None,
+                base_rate_set=self.rate_set,
+            )
+            n_walkers = max(ic.n_chains, 2 * model.n_dim + 2)
+            fit_options = {"n_samples": ic.n_samples, "n_warmup": ic.n_warmup, "n_walkers": n_walkers, **kwargs}
+            metadata["inference_options"] = {**fit_options, "random_effects": list(ic.random_effects)}
+            hierarchical_result = model.fit(
+                **fit_options,
+                checkpoint=runtime.get("checkpoint"),
+                progress=runtime.get("progress"),
+            )
+            return InferenceResult(
+                method="hierarchical",
+                mcmc=hierarchical_result,
+                context=self.config.context,
+                metadata=metadata,
+            )
+
+        elif ic.mode == "pmcmc":
+            # Particle MCMC through the same likelihood, so the chain targets
+            # the configured model (base rates, PK, every series).
+            runtime = {key: kwargs.pop(key) for key in ("progress", "max_total_events") if key in kwargs}
+            sampler = ParticleMCMC.from_likelihood(
+                likelihood,
+                priors,
+                n_particles=ic.n_particles,
+                rng=np.random.default_rng(self.config.seed),
+                max_total_events=runtime.get("max_total_events"),
+            )
+            # A random prior draw can start where every particle dies; the
+            # prior medians are a safer default start.
+            initial = kwargs.pop("initial_params", None) or {
+                name: float(priors.distributions[name].median())
+                for name in likelihood.param_names
+            }
+            sample_options = {
+                "n_samples": ic.n_samples,
+                "n_warmup": ic.n_warmup,
+                "proposal_scale": ic.proposal_scale,
+                **kwargs,
+            }
+            metadata["inference_options"] = {
+                **sample_options,
+                "n_particles": ic.n_particles,
+                "initial_params": initial,
+            }
+            pmcmc_result = sampler.sample(
+                **sample_options, initial_params=initial, progress=runtime.get("progress")
+            )
+            return InferenceResult(
+                method="pmcmc",
+                mcmc=pmcmc_result,
+                context=self.config.context,
+                metadata=metadata,
             )
 
         else:

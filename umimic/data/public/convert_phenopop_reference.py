@@ -62,6 +62,8 @@ from pathlib import Path
 
 import numpy as np
 
+from umimic.data.public_datasets import _resolve_default_data_root
+
 FIT_FIELDS = [
     "dataset",
     "variant",
@@ -191,7 +193,7 @@ def _extract(mat: dict, stem: str) -> tuple[list[dict], list[dict]]:
 def convert(source: Path, dest_dir: Path | None = None) -> tuple[Path, Path]:
     import scipy.io
 
-    dest = dest_dir or Path(__file__).resolve().parent / "phenopop"
+    dest = dest_dir or _resolve_default_data_root() / "phenopop"
     dest.mkdir(parents=True, exist_ok=True)
 
     fits: list[dict] = []

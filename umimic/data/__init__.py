@@ -1,6 +1,6 @@
 """Data loading, schemas, and public dataset access."""
 
-from .loaders import load_csv
+from .loaders import load_csv, save_dataset
 from .public_datasets import (
     BESTDR_CITATION,
     NCI60_CITATION,
@@ -35,6 +35,7 @@ __all__ = [
     "ExperimentalDataset",
     # Loaders
     "load_csv",
+    "save_dataset",
     # Public Datasets
     "load_bestdr",
     "load_phenopop",

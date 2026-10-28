@@ -1,80 +1,115 @@
-"""Data loading and saving utilities for CSV experimental data.
+"""CSV interchange for experimental datasets, without a pandas dependency.
 
-Dataset interchange format
---------------------------
-U-MIMIC reads and writes a single tidy CSV layout, one row per (replicate,
-time point):
-
-    hours,viable_count,concentration,replicate_id[,bli][,volume]
-    0,100,0.0,well_1
-    4,150,0.0,well_1
-
-`hours` is the observation time, `viable_count` the cell count, and
-`concentration` the drug concentration for that replicate. Optional `bli` and
-`volume` columns carry the other modalities. Empty cells denote missing
-observations and are loaded as NaN.
-
-:func:`save_dataset` writes this format and :func:`load_csv` reads it, so a
-dataset produced by ``umimic generate`` can be fitted by ``umimic fit``
-without manual conversion.
+One row records one time point in a series. At least one observation column
+is required: ``viable_count``, ``bli``, ``volume``, or ``biomarker``. Empty
+observation cells represent missing values. ``save_dataset`` also writes
+series/group identifiers so replicate labels can be reused between groups.
+Legacy CSVs without these extra columns remain supported.
 """
 
 from __future__ import annotations
 
+import bz2
 import csv
+import gzip
+import lzma
 from pathlib import Path
 
 import numpy as np
 
-from umimic.data.schemas import TimeSeriesData, ExperimentalDataset
+from umimic.data.schemas import ExperimentalDataset, TimeSeriesData
 
-#: Column name written for each modality key.
+
 MODALITY_COLUMNS = {
     "cell_counts": "viable_count",
     "bli": "bli",
     "volume": "volume",
+    "biomarker": "biomarker",
 }
+_MODALITY_ALIASES = {
+    "bli": ("bli", "bioluminescence", "photon_flux"),
+    "volume": ("volume", "tumor_volume"),
+    "biomarker": ("biomarker",),
+}
+_OBSERVATION_PREFIX = "observation:"
+
+
+def _open_csv(path: Path, mode: str):
+    """Keep compressed CSV support without relying on pandas compression inference."""
+    opener = {".gz": gzip.open, ".bz2": bz2.open, ".xz": lzma.open}.get(path.suffix)
+    encoding = "utf-8-sig" if mode == "r" else "utf-8"
+    if opener is not None:
+        return opener(path, mode + "t", newline="", encoding=encoding)
+    return path.open(mode, newline="", encoding=encoding)
+
+
+def _optional_number(value: str | None) -> float | None:
+    """Treat blank/NaN scalar concentrations as unspecified, never as NaN C."""
+    if value is None or not value.strip():
+        return None
+    number = float(value)
+    if np.isnan(number):
+        return None
+    if not np.isfinite(number) or number < 0:
+        raise ValueError("concentration must be finite and non-negative.")
+    return number
+
+
+def _observation_number(value: str | None) -> float:
+    return float(value) if value is not None and value.strip() else float("nan")
 
 
 def save_dataset(dataset: ExperimentalDataset, path: str | Path) -> Path:
-    """Write an ExperimentalDataset to the interchange CSV format.
+    """Write all observation modalities and series identities to a tidy CSV.
 
-    Args:
-        dataset: Dataset to write.
-        path: Destination CSV path.
-
-    Returns:
-        The path written.
+    Unrecognized modality names use ``observation:<name>`` columns, avoiding
+    ambiguity with annotation columns in user-supplied files. Per-observation
+    concentrations, when supplied, use ``concentration_at_time`` separately
+    from the scalar concentration. Dataset context is retained as well.
     """
+    present: dict[str, str] = {}
+    for series in dataset.series:
+        for key in series.modalities:
+            present.setdefault(key, MODALITY_COLUMNS.get(key, f"{_OBSERVATION_PREFIX}{key}"))
+    if not present:
+        raise ValueError("Dataset contains no observation modalities to save.")
+
+    has_concentrations = any(s.concentrations is not None for s in dataset.series)
+    header = [
+        "hours",
+        *present.values(),
+        "concentration",
+        "replicate_id",
+        "group_id",
+        "series_id",
+        "context",
+    ]
+    if has_concentrations:
+        header.append("concentration_at_time")
+
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-
-    present = []
-    for key, column in MODALITY_COLUMNS.items():
-        if any(s.has_modality(key) for s in dataset.series):
-            present.append((key, column))
-    if not present:
-        raise ValueError("Dataset contains no recognized modalities to save.")
-
-    header = ["hours"] + [c for _, c in present] + ["concentration", "replicate_id"]
-
-    with path.open("w", newline="", encoding="utf-8") as fh:
+    with _open_csv(path, "w") as fh:
         writer = csv.writer(fh)
         writer.writerow(header)
         for i, series in enumerate(dataset.series):
-            replicate = series.replicate_id or series.group_id or f"series_{i}"
-            conc = "" if series.concentration is None else series.concentration
             for k, t in enumerate(series.times):
                 row = [t]
-                for key, _ in present:
-                    if series.has_modality(key):
-                        value = series.observations[key][k]
-                        row.append("" if np.isnan(value) else value)
-                    else:
-                        row.append("")
-                row.extend([conc, replicate])
+                for key in present:
+                    value = series.observations[key][k] if series.has_modality(key) else np.nan
+                    row.append("" if np.isnan(value) else value)
+                row.extend(
+                    [
+                        "" if series.concentration is None else series.concentration,
+                        series.replicate_id if series.replicate_id is not None else "",
+                        series.group_id if series.group_id is not None else "",
+                        str(i),
+                        dataset.context,
+                    ]
+                )
+                if has_concentrations:
+                    row.append("" if series.concentrations is None else series.concentrations[k])
                 writer.writerow(row)
-
     return path
 
 
@@ -86,75 +121,100 @@ def load_csv(
     concentration_column: str = "concentration",
     replicate_column: str = "replicate_id",
 ) -> ExperimentalDataset:
-    """Load experimental data from a CSV file.
+    """Load a tidy CSV with one series per group, replicate and concentration.
 
-    Expected CSV format:
-        hours, viable_count, concentration, replicate_id
-        0, 100, 0.0, well_1
-        4, 150, 0.0, well_1
-        ...
-
-    Args:
-        path: Path to CSV file.
-        data_config: Optional DataConfig for column names.
-        time_column: Name of time column.
-        count_column: Name of count column.
-        concentration_column: Name of concentration column.
-        replicate_column: Name of replicate/group column.
-
-    Returns:
-        ExperimentalDataset with one TimeSeriesData per replicate.
+    A count column is optional when other observation modalities are present.
+    Exported ``series_id`` takes precedence over inferred grouping. Blank
+    concentrations remain ``None``; empty observations become NaN. Custom
+    column names from ``data_config`` work without optional dependencies.
     """
-    try:
-        import pandas as pd
-    except ImportError:
-        return _load_csv_numpy(path, time_column, count_column,
-                                concentration_column, replicate_column)
-
     if data_config is not None:
         time_column = data_config.time_column
         count_column = data_config.count_column
         concentration_column = data_config.concentration_column
         replicate_column = data_config.replicate_column
+    return _load_csv_rows(path, time_column, count_column, concentration_column, replicate_column)
 
-    df = pd.read_csv(path)
+
+def _load_csv_rows(
+    path: str | Path,
+    time_col: str,
+    count_col: str,
+    conc_col: str,
+    rep_col: str,
+) -> ExperimentalDataset:
+    with _open_csv(Path(path), "r") as fh:
+        reader = csv.DictReader(fh)
+        fields = reader.fieldnames or []
+        if time_col not in fields:
+            raise ValueError(f"CSV is missing time column {time_col!r}.")
+        modality_columns = {}
+        if count_col in fields:
+            modality_columns["cell_counts"] = count_col
+        for key, aliases in _MODALITY_ALIASES.items():
+            column = next((name for name in aliases if name in fields), None)
+            if column is not None:
+                modality_columns[key] = column
+        for column in fields:
+            if column.startswith(_OBSERVATION_PREFIX) and column[len(_OBSERVATION_PREFIX) :]:
+                modality_columns[column[len(_OBSERVATION_PREFIX) :]] = column
+        if not modality_columns:
+            raise ValueError("CSV contains no recognized observation columns.")
+
+        grouped = {}
+        contexts = set()
+        for row in reader:
+            conc = _optional_number(row.get(conc_col))
+            group = row.get("group_id") or None
+            replicate = row.get(rep_col) or None
+            series_id = row.get("series_id")
+            # Old plate CSVs often reuse replicate numbers at each dose.
+            key = ("series", series_id) if series_id else ("legacy", group, replicate, conc)
+            grouped.setdefault(key, []).append((row, conc, group, replicate))
+            if row.get("context"):
+                contexts.add(row["context"])
+    if len(contexts) > 1:
+        raise ValueError("CSV contains conflicting dataset contexts.")
 
     series = []
-    groups = df[replicate_column].unique() if replicate_column in df.columns else ["all"]
-
-    for group_id in groups:
-        if replicate_column in df.columns:
-            sub = df[df[replicate_column] == group_id].sort_values(time_column)
-        else:
-            sub = df.sort_values(time_column)
-
-        times = sub[time_column].values.astype(float)
-        counts = sub[count_column].values.astype(float)
-
-        conc = None
-        if concentration_column in sub.columns:
-            conc = float(sub[concentration_column].iloc[0])
-
-        observations = {"cell_counts": counts}
-
-        # Check for other modalities
-        for col in ["bli", "bioluminescence", "photon_flux"]:
-            if col in sub.columns:
-                observations["bli"] = sub[col].values.astype(float)
-        for col in ["volume", "tumor_volume"]:
-            if col in sub.columns:
-                observations["volume"] = sub[col].values.astype(float)
-
-        ts = TimeSeriesData(
-            times=times,
-            observations=observations,
-            concentration=conc,
-            group_id=str(group_id),
-            replicate_id=str(group_id),
+    for rows in grouped.values():
+        rows.sort(key=lambda item: float(item[0][time_col]))
+        _, conc, group, replicate = rows[0]
+        if any(item[1:] != (conc, group, replicate) for item in rows):
+            raise ValueError(
+                "Rows sharing a series_id have conflicting concentration or identifiers."
+            )
+        observations = {
+            key: np.array([_observation_number(item[0].get(column)) for item in rows])
+            for key, column in modality_columns.items()
+        }
+        concentrations = None
+        if "concentration_at_time" in fields:
+            values = [_optional_number(item[0].get("concentration_at_time")) for item in rows]
+            if any(value is not None for value in values):
+                if any(value is None for value in values):
+                    raise ValueError(
+                        "concentration_at_time must be specified at every series time point."
+                    )
+                concentrations = np.asarray(values, dtype=float)
+        # Files written before group_id was added used the replicate as group.
+        if "group_id" not in fields:
+            group = replicate or "all"
+        series.append(
+            TimeSeriesData(
+                times=np.array([float(item[0][time_col]) for item in rows]),
+                observations=observations,
+                concentration=conc,
+                concentrations=concentrations,
+                group_id=group,
+                replicate_id=replicate,
+            )
         )
-        series.append(ts)
-
-    return ExperimentalDataset(series=series, name=Path(path).stem)
+    return ExperimentalDataset(
+        series=series,
+        name=Path(path).stem,
+        context=next(iter(contexts), "in_vitro"),
+    )
 
 
 def _load_csv_numpy(
@@ -164,15 +224,5 @@ def _load_csv_numpy(
     conc_col: str,
     rep_col: str,
 ) -> ExperimentalDataset:
-    """Fallback CSV loader using only numpy (no pandas dependency)."""
-    data = np.genfromtxt(path, delimiter=",", names=True, dtype=None, encoding=None)
-
-    # Simple: load as single series
-    times = data[time_col].astype(float)
-    counts = data[count_col].astype(float)
-
-    ts = TimeSeriesData(
-        times=times,
-        observations={"cell_counts": counts},
-    )
-    return ExperimentalDataset(series=[ts], name=Path(path).stem)
+    """Backward-compatible entry point for the dependency-free CSV parser."""
+    return _load_csv_rows(path, time_col, count_col, conc_col, rep_col)

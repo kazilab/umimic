@@ -180,6 +180,14 @@ The ODE is the expectation of the jump process in the large-population limit:
 
 Optional `rate_multiplier_fn(t, key)` scales named rates in time (e.g. scheduled interventions); non-finite or negative multipliers are ignored (treated as 1).
 
+The matrix-exponential fast path requires an explicitly constant exposure,
+such as `ExposureProfile.constant(c)`. A custom callable may declare
+`is_constant = True`; otherwise it uses numerical integration. The ODE and
+moment solvers integrate separately across exposure `breakpoints(start, end)`.
+PK profiles supply dose times, infusion stops, and cache knots automatically;
+custom pulsed exposures should supply their own breakpoints so an adaptive
+solver cannot step across a complete pulse during a stationary interval.
+
 **Assumption:** well-mixed, continuous counts; no demographic stochasticity. Appropriate for large \(N\) or as the LNA mean.
 
 ---
@@ -206,6 +214,12 @@ Binary fission is encoded as net \(+1\) (one cell becomes two). Propensities are
 | Forced `"direct"` + varying \(C\) | Frozen propensities per interval | **Approximate**; metadata `exact=False` |
 
 **Extrande caveat:** the bound on total propensity over a look-ahead window is a **grid maximum × `bound_safety`**, not a proven analytic envelope. Extremely sharp PK peaks between sample points could under-bound. Increase `bound_samples` / `bound_safety` or shorten `lookahead` if exposure is spiked.
+
+Automatic direct-method selection requires the same explicit constancy
+metadata as the ODE fast path. Unknown callables use thinning. Zero propensity
+in one look-ahead window means the simulator waits for the next window; it
+does not declare a nonempty, dormant population extinct. Known exposure
+breakpoints cap thinning windows, direct holding times, and tau leaps.
 
 Negative counts after a jump raise an error (inconsistent propensity/stoichiometry) rather than silent clipping.
 

@@ -33,7 +33,11 @@ public/
 ```
 
 Set ``UMIMIC_DATA_ROOT`` to point loaders at an external cache directory with
-the same subfolder names if you prefer data outside the package tree.
+the same subfolder names if you prefer data outside the package tree. The
+download script and converter output defaults use that directory too; the
+download script creates it when necessary. Set the variable before importing
+the data modules. Converter source-file arguments can be supplied explicitly
+when rebuilding from raw archives stored elsewhere.
 
 ## Quick start
 

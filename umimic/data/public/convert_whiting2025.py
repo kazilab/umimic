@@ -33,6 +33,8 @@ import zipfile
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
+from umimic.data.public_datasets import _resolve_default_data_root
+
 FIELDS = [
     "hours",
     "day",
@@ -93,7 +95,7 @@ def _sheet_rows(xlsx_bytes: bytes, sheet_index: int) -> list[list[str | None]]:
 
 
 def convert(source: Path, dest_dir: Path | None = None) -> Path:
-    dest = dest_dir or Path(__file__).resolve().parent / "whiting2025_barcode"
+    dest = dest_dir or _resolve_default_data_root() / "whiting2025_barcode"
     dest.mkdir(parents=True, exist_ok=True)
 
     if source.suffix.lower() == ".zip":

@@ -58,6 +58,8 @@ from pathlib import Path
 
 import numpy as np
 
+from umimic.data.public_datasets import _resolve_default_data_root
+
 FIELDS = [
     "experiment",
     "context",
@@ -91,7 +93,7 @@ def _classify(key: str) -> tuple[str, str] | None:
 def convert(source: Path, dest_dir: Path | None = None) -> Path:
     import scipy.io
 
-    dest = dest_dir or Path(__file__).resolve().parent / "csc_dip"
+    dest = dest_dir or _resolve_default_data_root() / "csc_dip"
     dest.mkdir(parents=True, exist_ok=True)
 
     rows: list[dict] = []

@@ -12,6 +12,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from umimic.inference.likelihood import PARAMETER_SETS
+from umimic.time_grid import validate_observation_times
 
 logger = logging.getLogger(__name__)
 
@@ -722,7 +723,7 @@ class InferenceConfig(_ValidatedModel):
     # they failed at run time with "Unknown inference mode" after the data had
     # been loaded. The ParticleMCMC and hierarchical estimators remain
     # available directly from umimic.inference.
-    mode: Literal["mle", "mcmc"] = "mle"
+    mode: Literal["mle", "mcmc", "pmcmc", "hierarchical"] = "mle"
     # "pymc" is deliberately absent: the backend was withdrawn in 0.0.4
     # because its model ignored the data.
     backend: Literal["scipy", "emcee", "particle"] = "scipy"
@@ -752,6 +753,13 @@ class InferenceConfig(_ValidatedModel):
     #: `_warn_on_inert_settings`.
     n_particles: int = 500
     n_restarts: int = 5
+    #: Random-walk step of particle MCMC (mode "pmcmc"), on the log scale for
+    #: strictly positive parameters.
+    proposal_scale: float = 0.05
+    #: Parameters that vary by series in a hierarchical fit (mode
+    #: "hierarchical"), each around a population median with a between-series
+    #: spread. The rest of the parameter set is shared by every series.
+    random_effects: list[str] = Field(default_factory=list)
 
     @field_validator("n_samples", "n_chains", "n_warmup", "n_particles", "n_restarts")
     @classmethod
@@ -759,6 +767,35 @@ class InferenceConfig(_ValidatedModel):
         if v <= 0:
             raise ValueError("Inference counts must be > 0")
         return v
+
+    @field_validator("proposal_scale")
+    @classmethod
+    def _positive_scale(cls, v: float) -> float:
+        if not np.isfinite(v) or v <= 0:
+            raise ValueError("proposal_scale must be finite and > 0")
+        return v
+
+    @model_validator(mode="after")
+    def _random_effects_are_parameters(self) -> InferenceConfig:
+        if self.mode != "hierarchical":
+            return self
+        from umimic.inference.likelihood import PARAMETER_SETS
+
+        names = PARAMETER_SETS[self.parameter_set]
+        if not self.random_effects:
+            raise ValueError(
+                "inference.mode='hierarchical' needs random_effects: the "
+                f"parameters that vary by series, from {names}."
+            )
+        unknown = [name for name in self.random_effects if name not in names]
+        if unknown:
+            raise ValueError(
+                f"random_effects {unknown} are not in parameter set "
+                f"{self.parameter_set!r}: {names}."
+            )
+        if len(set(self.random_effects)) != len(self.random_effects):
+            raise ValueError("random_effects lists a parameter twice.")
+        return self
 
     @model_validator(mode="after")
     def _backend_is_dispatched(self) -> InferenceConfig:
@@ -769,25 +806,48 @@ class InferenceConfig(_ValidatedModel):
         ensemble sampler instead and reported success. A backend that is not
         dispatched has to fail here, before any data is loaded.
         """
-        if self.backend == "particle":
+        if self.backend == "particle" and self.mode != "pmcmc":
             raise ValueError(
-                "backend='particle' is not dispatched by Experiment.fit(): it "
-                "would silently run emcee (mode='mcmc') or Nelder-Mead MAP "
-                "(mode='mle') instead. Particle inference is available "
-                "directly as umimic.inference.ParticleMCMC, which takes a "
-                "single TimeSeriesData."
+                "backend='particle' is not dispatched for mode "
+                f"{self.mode!r}: it would silently run emcee (mode='mcmc') or "
+                "Nelder-Mead MAP (mode='mle') instead. Particle inference "
+                "(ParticleMCMC) runs with inference.mode='pmcmc'."
             )
         return self
 
 
 class PriorConfig(_ValidatedModel):
-    """Configuration for prior distributions."""
+    """Configuration for prior distributions.
+
+    Five priors have named defaults. Any other model parameter may be given
+    one the same way -- for example ``u_PQ`` or ``emax_death_R``, as
+    transferred priors often are -- and an unknown name is rejected rather
+    than ignored.
+    """
+
+    model_config = ConfigDict(validate_assignment=True, extra="allow")
 
     b0: dict[str, float] = {"dist_param_scale": 0.04, "dist_param_s": 0.5}
     d0_P: dict[str, float] = {"dist_param_scale": 0.01, "dist_param_s": 0.5}
     emax_death: dict[str, float] = {"dist_param_scale": 0.1}
     ec50_death: dict[str, float] = {"dist_param_scale": 1.0, "dist_param_s": 1.0}
     hill_death: dict[str, float] = {"dist_param_scale": 1.5, "dist_param_s": 0.3}
+
+    @model_validator(mode="after")
+    def _known_extra_priors(self) -> PriorConfig:
+        from umimic.inference.likelihood import KNOWN_PARAM_NAMES
+
+        for name, value in (self.model_extra or {}).items():
+            if name not in KNOWN_PARAM_NAMES:
+                raise ValueError(
+                    f"priors.{name}: no model parameter has that name. Known: "
+                    f"{sorted(KNOWN_PARAM_NAMES)}."
+                )
+            if not isinstance(value, dict) or set(value) - {"dist_param_scale", "dist_param_s"}:
+                raise ValueError(
+                    f"priors.{name} must be {{dist_param_scale: ..., dist_param_s: ...}}."
+                )
+        return self
 
 
 class DataConfig(_ValidatedModel):
@@ -808,6 +868,7 @@ class SimulationConfig(_ValidatedModel):
     initial_cells: int = 100
     t_max: float = 72.0
     dt_obs: float = 4.0
+    observation_times: list[float] | None = None
     n_replicates: int = 4
     #: Overrides the top-level `seed` for simulation when set. None means
     #: "use ExperimentConfig.seed"; an explicit value wins.
@@ -823,9 +884,15 @@ class SimulationConfig(_ValidatedModel):
     @field_validator("t_max", "dt_obs")
     @classmethod
     def _positive_times(cls, v: float) -> float:
-        if v <= 0:
-            raise ValueError("t_max and dt_obs must be > 0")
+        if not np.isfinite(v) or v <= 0:
+            raise ValueError("t_max and dt_obs must be > 0 and finite")
         return v
+
+    @model_validator(mode="after")
+    def _valid_observation_schedule(self) -> SimulationConfig:
+        if self.observation_times is not None:
+            validate_observation_times(self.observation_times, self.t_max)
+        return self
 
     @field_validator("seed")
     @classmethod
@@ -904,6 +971,14 @@ class ExperimentConfig(_ValidatedModel):
                 "Set pk.model='one_compartment' or 'two_compartment', or use "
                 "dosing.type='constant' for a fixed-concentration exposure."
             )
+        # Oral doses enter an absorption compartment; without ka the PK model
+        # cannot move them into plasma, and the run would fail only at simulation.
+        if self.dosing.type == "oral" and self.pk.ka is None:
+            raise ValueError(
+                "dosing.type='oral' needs pk.ka, the absorption rate constant "
+                "(1/h), to move each dose from the gut into plasma. Set pk.ka, "
+                "or use a bolus schedule for intravenous dosing."
+            )
 
         _warn_on_inert_settings_impl(self)
 
@@ -924,11 +999,10 @@ def _warn_on_inert_settings_impl(cfg: ExperimentConfig) -> None:
     warnings rather than errors because the fields remain meaningful when the
     corresponding component is driven directly from Python.
     """
-    if cfg.inference.n_particles != 500:
+    if cfg.inference.n_particles != 500 and cfg.inference.mode != "pmcmc":
         logger.warning(
-            "inference.n_particles=%s is set, but the pipeline does not "
-            "dispatch the particle backend, so it will not be used. Drive "
-            "umimic.inference.ParticleMCMC directly to use it.",
+            "inference.n_particles=%s is set, but only inference.mode='pmcmc' "
+            "uses it, so it will not be used.",
             cfg.inference.n_particles,
         )
     if cfg.signaling.observed_nodes:

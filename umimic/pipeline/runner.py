@@ -42,7 +42,7 @@ def _default_log_path(args: argparse.Namespace) -> Path:
 
 
 def _configure_logging(args: argparse.Namespace) -> Path:
-    """Configure stdout + file logging and return log file path.
+    """Configure stderr + file logging and return log file path.
 
     Uses a package-specific logger ("umimic") instead of the root logger
     so that library consumers' logging configuration is not overwritten.
@@ -56,9 +56,11 @@ def _configure_logging(args: argparse.Namespace) -> Path:
     pkg_logger = logging.getLogger("umimic")
     pkg_logger.setLevel(level)
     # Remove any previously attached handlers to avoid duplicate output
-    pkg_logger.handlers.clear()
+    for handler in pkg_logger.handlers[:]:
+        pkg_logger.removeHandler(handler)
+        handler.close()
 
-    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler = logging.StreamHandler(sys.stderr)
     stream_handler.setFormatter(fmt)
     pkg_logger.addHandler(stream_handler)
 
@@ -91,9 +93,9 @@ def main():
     sim_parser.add_argument("--config", type=str, help="Path to YAML config")
     sim_parser.add_argument("--output", type=str, default="results/simulation",
                            help="Output directory")
-    sim_parser.add_argument("--drug-type", type=str, default="cytotoxic",
+    sim_parser.add_argument("--drug-type", type=str, default=None,
                            choices=["cytotoxic", "cytostatic", "mixed"],
-                           help="Drug mechanism type")
+                           help="Override drug mechanism (default demo: cytotoxic)")
     _add_logging_args(sim_parser)
 
     # Fit command
@@ -194,47 +196,79 @@ def main():
 
 def _run_simulate(args):
     """Run simulation command."""
-    from umimic.pipeline.config import load_config, ExperimentConfig
+    from umimic.pipeline.config import load_config, save_config, ExperimentConfig
     from umimic.pipeline.experiment import Experiment
-    from umimic.dynamics.rates import RateSet
+    from umimic.pipeline.results import NumpyEncoder
 
     if args.config:
         config = load_config(args.config)
         LOGGER.info("Loaded config from %s", args.config)
     else:
-        config = ExperimentConfig()
-        LOGGER.info("Using default ExperimentConfig")
+        config = ExperimentConfig(
+            dosing={"concentrations": [0, 0.1, 0.3, 1, 3, 10, 30]},
+            dynamics={"drug_mechanism": "cytotoxic"},
+            simulation={"method": "ode"},
+        )
+        LOGGER.info("Using cytotoxic dose-response demonstration config")
+
+    if args.drug_type is not None:
+        raw = config.model_dump(mode="json")
+        raw["dynamics"]["drug_mechanism"] = args.drug_type
+        if args.drug_type in ("cytostatic", "mixed"):
+            # Keep the effective configuration valid for a later fit as well.
+            raw["inference"]["parameter_set"] = "mechanism"
+            raw["inference"]["forward_mode"] = "moment"
+        config = ExperimentConfig(**raw)
 
     exp = Experiment(config)
 
-    builders = {
-        "cytotoxic": RateSet.cytotoxic_drug,
-        "cytostatic": RateSet.cytostatic_drug,
-        "mixed": RateSet.mixed_drug,
-    }
-    rs = builders[args.drug_type]()
-
-    concentrations = config.dosing.concentrations or [0, 0.1, 0.3, 1, 3, 10, 30]
-    results = exp.simulate(rate_set=rs, method="ode", concentrations=concentrations)
-    LOGGER.info("Simulated %d concentration conditions", len(results))
+    if config.pk.model == "none" and not config.signaling.enabled:
+        results = exp.simulate(concentrations=config.dosing.concentrations or [0.0])
+    else:
+        if config.signaling.enabled and len(config.dosing.concentrations or []) > 1:
+            raise ValueError("Signaling simulation supports a single exposure, not a dose panel")
+        results = exp.simulate()
 
     # Save plots
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
     LOGGER.info("Saving simulation artifacts to %s", out_dir)
 
-    from umimic.visualization.trajectories import plot_dose_response_trajectories
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from umimic.visualization.trajectories import (
+        plot_dose_response_trajectories, plot_population_trajectories,
+    )
     from umimic.visualization.dose_response import plot_rate_dose_response, plot_net_growth_curve
 
-    fig = plot_dose_response_trajectories(results, title=f"Dose-Response ({args.drug_type})")
+    if isinstance(results, dict):
+        fig = plot_dose_response_trajectories(results, title=config.name)
+        simulations = [
+            {"concentration": conc, "times": result.times,
+             "populations": result.populations, "metadata": result.metadata}
+            for conc, result in results.items()
+        ]
+    else:
+        fig = plot_population_trajectories(results, title=config.name)
+        simulations = [{"times": results.times, "populations": results.populations,
+                        "metadata": results.metadata}]
     fig.savefig(out_dir / "trajectories.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
-    fig2 = plot_rate_dose_response(rs, topology=exp.topology)
+    fig2 = plot_rate_dose_response(exp.rate_set, topology=exp.topology)
     fig2.savefig(out_dir / "rate_dose_response.png", dpi=150, bbox_inches="tight")
+    plt.close(fig2)
 
     # Asymptotic multi-state growth (not naive b - d_P).
-    fig3 = plot_net_growth_curve(rs, topology=exp.topology)
+    fig3 = plot_net_growth_curve(exp.rate_set, topology=exp.topology)
     fig3.savefig(out_dir / "net_growth.png", dpi=150, bbox_inches="tight")
+    plt.close(fig3)
+    save_config(config, out_dir / "config.yaml")
+    with (out_dir / "simulation.json").open("w", encoding="utf-8") as stream:
+        json.dump({"config": config.model_dump(mode="json"), "simulations": simulations},
+                  stream, indent=2, cls=NumpyEncoder)
 
     print(f"Simulation results saved to {out_dir}")
     LOGGER.info("Saved simulation plots to %s", out_dir)
@@ -256,6 +290,7 @@ def _run_fit(args):
     # nothing in the output said so.
     data_path = args.data or config.data.path
     if data_path:
+        config.data.path = str(data_path)
         from umimic.data.loaders import load_csv
         dataset = load_csv(data_path, config.data)
         source = "--data" if args.data else "config data.path"

@@ -14,16 +14,21 @@ diagnostics account for this.
 
 from __future__ import annotations
 
+import logging
 import multiprocessing
 import os
 import pickle
+from collections.abc import Callable
 
 import numpy as np
 
+from umimic.inference.checkpoint import CheckpointMismatch, MCMCCheckpoint
 from umimic.inference.likelihood import ModelLikelihood
 from umimic.inference.priors import PriorSpec
 from umimic.types import MCMCResult
 
+
+logger = logging.getLogger(__name__)
 
 # Module-level references for multiprocessing.
 # With the 'spawn' start method (default on macOS), child processes get a
@@ -108,6 +113,8 @@ class MCMCSampler:
         n_warmup: int = 1000,
         initial_guess: np.ndarray | None = None,
         n_processes: int = 1,
+        checkpoint: MCMCCheckpoint | None = None,
+        progress: Callable[[str, int, int], None] | None = None,
         **kwargs,
     ) -> MCMCResult:
         """Run MCMC sampling.
@@ -121,13 +128,19 @@ class MCMCSampler:
                 1 (default) = serial execution (safest, works in Jupyter).
                 Set > 1 to enable multiprocessing (recommended for scripts).
                 None = auto-detect CPU count.
+            checkpoint: Save the run as it goes and resume a matching saved
+                run exactly (see :mod:`umimic.inference.checkpoint`).
+            progress: Called after every step as
+                ``progress(phase, steps_done, steps_in_phase)`` with phase
+                ``"warmup"`` or ``"production"``.
 
         Returns:
             MCMCResult with posterior samples and diagnostics.
         """
         if self.backend == "emcee":
             return self._sample_emcee(
-                n_samples, n_chains, n_warmup, initial_guess, n_processes
+                n_samples, n_chains, n_warmup, initial_guess, n_processes,
+                checkpoint=checkpoint, progress=progress,
             )
         if self.backend == "pymc":
             raise NotImplementedError(
@@ -152,6 +165,8 @@ class MCMCSampler:
         n_warmup: int,
         initial_guess: np.ndarray | None,
         n_processes: int = 1,
+        checkpoint: MCMCCheckpoint | None = None,
+        progress: Callable[[str, int, int], None] | None = None,
     ) -> MCMCResult:
         """Run emcee ensemble sampler with optional multiprocessing."""
         try:
@@ -241,13 +256,27 @@ class MCMCSampler:
 
         sampler.random_state = np.random.RandomState(emcee_seed).get_state()
 
-        try:
-            # Burn-in
-            state = sampler.run_mcmc(p0, n_warmup, progress=False)
-            sampler.reset()
+        from umimic import __version__
 
-            # Production
-            sampler.run_mcmc(state, n_samples, progress=False)
+        # Everything that decides the draws, so a checkpoint is only reused
+        # by the run that wrote it.
+        run_identity = {
+            **(checkpoint.identity if checkpoint is not None else {}),
+            "sampler": {
+                "param_names": list(self.likelihood.param_names),
+                "n_walkers": n_walkers,
+                "n_warmup": n_warmup,
+                "n_samples": n_samples,
+                "seed": emcee_seed,
+                "emcee": emcee.__version__,
+                "umimic": __version__,
+            },
+        }
+
+        try:
+            resumed, missed_saves = _run_phases(
+                emcee, sampler, p0, n_warmup, n_samples, checkpoint, run_identity, progress
+            )
         finally:
             if pool is not None:
                 pool.close()
@@ -281,6 +310,10 @@ class MCMCSampler:
             # reported separately from the notion of independent chains.
             "walkers_are_independent_chains": False,
         }
+        if checkpoint is not None:
+            diagnostics["resumed_from"] = resumed
+            diagnostics["checkpoint_save_failures"] = missed_saves
+            diagnostics["checkpoint_discarded"] = checkpoint.discarded
 
         try:
             autocorr = sampler.get_autocorr_time(quiet=True)
@@ -296,3 +329,62 @@ class MCMCSampler:
             n_samples=n_samples,
             diagnostics=diagnostics,
         )
+
+
+def _run_phases(emcee, sampler, p0, n_warmup, n_samples, checkpoint, run_identity, progress):
+    """Warmup, then production, step by step; save and resume through checkpoint.
+
+    Equivalent to ``run_mcmc(p0, n_warmup)``, ``reset()``, ``run_mcmc(state,
+    n_samples)``: the same draws for the same seed. Returns the phase and step
+    a resumed run continued from (None for a fresh run), and how many
+    checkpoint saves failed. A failed save does not stop the run: the
+    previous checkpoint stays, and resuming from it is still exact.
+    """
+    saved = checkpoint.load(run_identity) if checkpoint is not None else None
+    if saved is None and checkpoint is not None and checkpoint.strict and checkpoint.discarded:
+        raise CheckpointMismatch(
+            f"The saved MCMC run could not be resumed: {checkpoint.discarded}. "
+            "Start a new run instead."
+        )
+    phase, done, state = "warmup", 0, p0
+    resumed = None
+    missed_saves = 0
+    if saved is not None:
+        phase, done = saved.phase, saved.steps_done
+        state = emcee.State(
+            saved.coords, log_prob=saved.log_prob, blobs=saved.blobs,
+            random_state=saved.random_state,
+        )
+        resumed = {"phase": phase, "steps_done": done}
+
+    for current, total in (("warmup", n_warmup), ("production", n_samples)):
+        if current == "warmup" and phase == "production":
+            continue
+        if current == "production":
+            # Warmup draws are discarded, as in run_mcmc followed by reset().
+            sampler.reset()
+            if phase == "production":
+                backend = sampler.backend
+                backend.chain = np.array(saved.chain)
+                backend.log_prob = np.array(saved.chain_log_prob)
+                backend.blobs = None if saved.chain_blobs is None else np.array(saved.chain_blobs)
+                backend.accepted = np.array(saved.accepted)
+                backend.iteration = len(saved.chain)
+                backend.random_state = saved.random_state
+            else:
+                done = 0
+            phase = "production"
+        for state in sampler.sample(state, iterations=total - done, progress=False):
+            done += 1
+            if checkpoint is not None and (done % checkpoint.every == 0 or done == total):
+                try:
+                    checkpoint.save(run_identity, current, done, state, sampler.backend)
+                except OSError as exc:
+                    missed_saves += 1
+                    logger.warning(
+                        "Could not save the MCMC checkpoint at %s step %d (%s); "
+                        "a resume would start from the previous one.", current, done, exc,
+                    )
+            if progress is not None:
+                progress(current, done, total)
+    return resumed, missed_saves

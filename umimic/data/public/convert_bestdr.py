@@ -22,6 +22,8 @@ import lzma
 import zipfile
 from pathlib import Path
 
+from umimic.data.public_datasets import _resolve_default_data_root
+
 FIELDS = [
     "hours",
     "viable_count",
@@ -87,7 +89,7 @@ def convert(
     dose_csv: Path | None = None,
     dest_dir: Path | None = None,
 ) -> Path:
-    dest = dest_dir or Path(__file__).resolve().parent / "bestdr"
+    dest = dest_dir or _resolve_default_data_root() / "bestdr"
     dest.mkdir(parents=True, exist_ok=True)
     rows: list[dict] = []
 

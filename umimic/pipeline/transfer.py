@@ -102,6 +102,7 @@ class TransferLearning:
         transfer_params: list[str] | None = None,
         shrinkage: float = 1.0,
         scale_factors: dict[str, float] | None = None,
+        max_sigma: float = 2.0,
     ):
         """
         Args:
@@ -125,6 +126,13 @@ class TransferLearning:
                 or ``{"b0": 0.25}`` for a xenograft growing at a quarter of the
                 culture rate. Applied to the prior's location; the relative
                 width is preserved.
+            max_sigma: Largest log-scale spread of an in vitro estimate that is
+                still transferred. A parameter the in vitro data barely
+                constrain -- an SE far above the estimate, or a posterior
+                spanning decades -- would otherwise become a "prior" that is
+                both uninformative and numerically extreme (a lognormal with
+                s = 20 has a mean of ~1e87). Such parameters are skipped with
+                the reason. The default 2 allows a 95% range of about 50-fold.
         """
         if not np.isfinite(shrinkage) or not (0.0 < shrinkage <= 1.0):
             raise ValueError(
@@ -139,6 +147,9 @@ class TransferLearning:
             else CONTEXT_INVARIANT_PARAMS
         )
         self.shrinkage = float(shrinkage)
+        if not np.isfinite(max_sigma) or max_sigma <= 0:
+            raise ValueError(f"max_sigma must be positive, got {max_sigma!r}.")
+        self.max_sigma = float(max_sigma)
 
         self.scale_factors = dict(scale_factors or {})
         for name, factor in self.scale_factors.items():
@@ -207,6 +218,18 @@ class TransferLearning:
                 continue
 
             sigma, location = fitted
+            if not np.isfinite(sigma) or sigma > self.max_sigma:
+                reason = (
+                    f"the in vitro data barely constrain it (log-scale spread "
+                    f"{sigma:.3g} > {self.max_sigma:g}), so a prior from it would "
+                    "carry no information"
+                )
+                self.skipped[name] = reason
+                logger.warning("Not transferring %s: %s.", name, reason)
+                continue
+            # Shrinkage widens the data's spread; the floor keeps a usable prior
+            # when the in vitro estimate is very precise.
+            sigma = max(sigma / self.shrinkage, 0.05)
             spec.add(name, stats.lognorm(s=sigma, scale=location * scale_factor))
 
         return spec
@@ -234,8 +257,7 @@ class TransferLearning:
             return None
 
         log_samples = np.log(positive)
-        sigma = float(np.std(log_samples)) / self.shrinkage
-        return max(sigma, 0.05), float(np.exp(np.mean(log_samples)))
+        return float(np.std(log_samples)), float(np.exp(np.mean(log_samples)))
 
     def _fit_from_point_estimate(self, name: str) -> tuple[float, float] | None:
         """Lognormal (sigma, median) around an MLE point estimate."""
@@ -259,10 +281,8 @@ class TransferLearning:
         if mle is not None and mle.se and name in mle.se and mle.se[name] is not None:
             se = float(mle.se[name])
 
-        se /= self.shrinkage  # inflate if shrinkage < 1
-        # Lognormal shape s ~ CV for moderate spreads; floor keeps a usable
-        # prior when SE is tiny or zero.
-        return max(se / max(abs(val), 1e-6), 0.05), val
+        # Lognormal shape s ~ CV for moderate spreads.
+        return se / max(abs(val), 1e-6), val
 
     def summarize_transfer(self) -> dict[str, Any]:
         """Summarize what was transferred and the prior specifications."""

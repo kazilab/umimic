@@ -43,7 +43,7 @@ import logging
 from dataclasses import dataclass
 
 import numpy as np
-from scipy import optimize, stats
+from scipy import optimize
 
 logger = logging.getLogger(__name__)
 
@@ -90,11 +90,17 @@ def clone_size_params(b: float, d: float, t: float) -> tuple[float, float]:
         denom = 1.0 + b * t
         return b * t / denom, b * t / denom
 
-    ert = np.exp(r * t)
-    denom = b * ert - d
-    if denom <= 0:                             # numerically degenerate
-        return np.nan, np.nan
-    return d * (ert - 1.0) / denom, b * (ert - 1.0) / denom
+    # Both numerator and denominator are negative in a subcritical process;
+    # that sign is valid. Use expm1 near criticality, and an inverse
+    # exponential for positive growth to avoid overflow at long follow-up.
+    if r > 0:
+        decay = np.exp(-r * t)
+        denom = b - d * decay
+        increment = -np.expm1(-r * t)
+    else:
+        increment = np.expm1(r * t)
+        denom = r + b * increment
+    return d * increment / denom, b * increment / denom
 
 
 def moments_to_rates(alpha: float, beta: float, t: float) -> tuple[float, float]:
@@ -171,13 +177,39 @@ def fit_clone_sizes(
     sizes = np.asarray(sizes, dtype=float)
     if sizes.ndim != 1 or sizes.size == 0:
         raise ValueError("`sizes` must be a non-empty 1-D array of clone sizes.")
+    unique, counts = np.unique(sizes, return_counts=True)
+    return fit_clone_size_histogram(unique, counts, t, detection=detection, b0=b0, d0=d0)
+
+
+def fit_clone_size_histogram(
+    sizes,
+    counts,
+    t: float,
+    detection: float = 1.0,
+    b0: float = 0.05,
+    d0: float = 0.01,
+) -> ClonalFit:
+    """:func:`fit_clone_sizes` from a size histogram: ``counts[i]`` clones of
+    ``sizes[i]`` cells. The likelihood depends only on the number of zeros,
+    the number of positive clones and their total excess size, so a study of
+    millions of clones needs no per-clone array.
+    """
+    sizes = np.asarray(sizes, dtype=float)
+    counts = np.asarray(counts, dtype=float)
+    if sizes.ndim != 1 or sizes.shape != counts.shape or sizes.size == 0:
+        raise ValueError("`sizes` and `counts` must be non-empty 1-D arrays of equal length.")
     if np.any(sizes < 0) or np.any(sizes != np.round(sizes)):
         raise ValueError("Clone sizes must be non-negative integers.")
+    if np.any(counts < 0) or np.any(counts != np.round(counts)) or counts.sum() == 0:
+        raise ValueError("Clone counts must be non-negative integers, not all zero.")
     if not 0.0 < detection <= 1.0:
         raise ValueError(f"detection must be in (0, 1], got {detection}.")
+    if not t > 0:
+        raise ValueError(f"Time must be positive, got {t}.")
 
-    n_zero = int(np.sum(sizes == 0))
-    positive = sizes[sizes > 0]
+    n_zero = int(counts[sizes == 0].sum())
+    n_positive = int(counts[sizes > 0].sum())
+    excess = float(np.sum((sizes[sizes > 0] - 1.0) * counts[sizes > 0]))
 
     def nll(theta: np.ndarray) -> float:
         b, d = np.exp(theta)
@@ -188,12 +220,12 @@ def fit_clone_sizes(
         beta = np.clip(beta, 1e-300, 1 - 1e-15)
         # An unobserved clone is extinct, or alive but missed.
         p_zero = alpha + (1.0 - alpha) * (1.0 - detection)
-        ll = n_zero * np.log(p_zero)
-        if positive.size:
-            ll += positive.size * (
+        ll = n_zero * np.log(p_zero) if n_zero else 0.0
+        if n_positive:
+            ll += n_positive * (
                 np.log1p(-alpha) + np.log(detection) + np.log1p(-beta)
             )
-            ll += float(np.sum(positive - 1.0)) * np.log(beta)
+            ll += excess * np.log(beta)
         return -ll if np.isfinite(ll) else 1e12
 
     best = None
@@ -216,10 +248,14 @@ def fit_clone_sizes(
         for i in range(2):
             for j in range(2):
                 xpp, xpm, xmp, xmm = (best.x.copy() for _ in range(4))
-                xpp[i] += eps; xpp[j] += eps
-                xpm[i] += eps; xpm[j] -= eps
-                xmp[i] -= eps; xmp[j] += eps
-                xmm[i] -= eps; xmm[j] -= eps
+                xpp[i] += eps
+                xpp[j] += eps
+                xpm[i] += eps
+                xpm[j] -= eps
+                xmp[i] -= eps
+                xmp[j] += eps
+                xmm[i] -= eps
+                xmm[j] -= eps
                 H[i, j] = (nll(xpp) - nll(xpm) - nll(xmp) + nll(xmm)) / (4 * eps**2)
         cov = np.linalg.inv(H)                  # delta method back to natural scale
         se = {
@@ -234,12 +270,28 @@ def fit_clone_sizes(
         death_rate=float(d),
         extinction_prob=float(alpha),
         death_birth_ratio=float(d / b) if b > 0 else np.nan,
-        n_clones=int(sizes.size),
+        n_clones=n_zero + n_positive,
         n_extinct=n_zero,
         log_likelihood=float(-best.fun),
         converged=bool(best.success),
         se=se,
     )
+
+
+def observed_clone_size_pmf(sizes, b: float, d: float, t: float, detection: float = 1.0) -> np.ndarray:
+    """Probability of *observing* each size, with imperfect detection.
+
+    A zero is an extinct clone or a missed survivor; a positive size is a
+    detected survivor of that size -- the law :func:`fit_clone_sizes` fits.
+    """
+    sizes = np.asarray(sizes, dtype=float)
+    alpha, beta = clone_size_params(b, d, t)
+    out = np.where(
+        sizes == 0,
+        alpha + (1.0 - alpha) * (1.0 - detection),
+        (1.0 - alpha) * detection * (1.0 - beta) * np.power(beta, np.maximum(sizes - 1.0, 0.0)),
+    )
+    return out
 
 
 def sample_clone_sizes(

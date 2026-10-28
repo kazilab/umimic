@@ -29,6 +29,7 @@ import numpy as np
 
 from umimic.dynamics.states import CellType, ModelTopology
 from umimic.dynamics.rates import RateSet
+from umimic.pk.exposure import exposure_breakpoints, is_constant_exposure
 from umimic.types import SimulationResult, EnsembleResult
 
 logger = logging.getLogger(__name__)
@@ -191,6 +192,14 @@ class GillespieSimulator:
         self.bound_samples = int(bound_samples)
         self.bound_safety = float(bound_safety)
         self.max_bound_refinements = int(max_bound_refinements)
+        if not np.isfinite(self.lookahead) or self.lookahead <= 0:
+            raise ValueError("lookahead must be finite and positive.")
+        if self.bound_samples < 2:
+            raise ValueError("bound_samples must be at least 2.")
+        if not np.isfinite(self.bound_safety) or self.bound_safety < 1:
+            raise ValueError("bound_safety must be finite and at least 1.")
+        if self.max_bound_refinements < 0:
+            raise ValueError("max_bound_refinements must be non-negative.")
 
         if exposure_mode not in ("auto", "constant", "thinning", "direct"):
             raise ValueError(
@@ -200,10 +209,8 @@ class GillespieSimulator:
         self.exposure_mode = exposure_mode
 
     def _is_constant_exposure(self, t_max: float, n_probe: int = 33) -> bool:
-        """Probe the exposure profile for time dependence."""
-        probes = np.linspace(0.0, max(t_max, 1e-9), n_probe)
-        values = np.array([float(self.exposure_fn(t)) for t in probes])
-        return bool(np.allclose(values, values[0], rtol=1e-12, atol=1e-12))
+        """Require explicit constancy metadata; finite probes can miss pulses."""
+        return is_constant_exposure(self.exposure_fn)
 
     def _resolve_method(self, t_max: float) -> tuple[str, bool]:
         """Choose the simulation method and whether it is exact.
@@ -215,8 +222,6 @@ class GillespieSimulator:
         user to treat an approximation as ground truth.
         """
         if self.exposure_mode == "direct":
-            # Explicitly requested, so the constancy probe is the only way to
-            # know whether the result is exact.
             return "direct", self._is_constant_exposure(t_max)
         if self.exposure_mode == "thinning":
             return "thinning", True
@@ -226,9 +231,9 @@ class GillespieSimulator:
             if not constant:
                 raise ValueError(
                     "exposure_mode='constant' requires a constant exposure "
-                    "profile, but exposure_fn varies with time. Use "
-                    "exposure_mode='thinning' for an exact time-varying "
-                    "simulation."
+                    "profile explicitly marked is_constant=True. Use "
+                    "ExposureProfile.constant(c), or exposure_mode='thinning' "
+                    "for a profile whose constancy is unknown."
                 )
             return "direct", True
         # "auto" only picks direct after confirming the exposure is constant.
@@ -250,7 +255,13 @@ class GillespieSimulator:
         These are sampled on a grid; `bound_safety` guards against
         under-resolving a sharp PK peak.
         """
+        if is_constant_exposure(self.exposure_fn):
+            return float(np.sum(self._propensities(state, t)) * self.bound_safety)
         probes = np.linspace(t, t + horizon, self.bound_samples)
+        # The next window owns its left endpoint. A post-bolus jump at this
+        # window's right boundary must not turn an otherwise idle interval
+        # into millions of unnecessary virtual events.
+        probes[-1] = np.nextafter(t + horizon, t)
         worst = np.zeros(len(self.reactions))
         for tp in probes:
             worst = np.maximum(worst, self._propensities(state, float(tp)))
@@ -277,6 +288,8 @@ class GillespieSimulator:
         if t_record is None:
             t_record = np.linspace(0, t_max, 100)
         t_record = np.asarray(t_record, dtype=float)
+        boundaries = exposure_breakpoints(self.exposure_fn, 0.0, t_max)
+        constant = is_constant_exposure(self.exposure_fn)
 
         method, exact = self._resolve_method(t_max)
         if not exact:
@@ -307,9 +320,18 @@ class GillespieSimulator:
         extinct = False
 
         while t < t_max:
+            if not np.any(state > 0):
+                extinct = True
+                break
             if n_events >= max_events:
                 truncated = True
                 break
+
+            boundary_index = np.searchsorted(boundaries, t, side="right")
+            next_boundary = (
+                float(boundaries[boundary_index])
+                if boundary_index < len(boundaries) else t_max
+            )
 
             if method == "thinning":
                 # Extrande: bound the propensity over a look-ahead window and
@@ -325,7 +347,7 @@ class GillespieSimulator:
                 # if it fails, discard the candidate and redraw on a halved
                 # window. Discarding is legitimate: the state has not changed and
                 # the exponential clock is memoryless, so no bias is introduced.
-                horizon = min(self.lookahead, t_max - t)
+                horizon = min(self.lookahead, next_boundary - t, t_max - t)
                 advanced_to_window_end = False
                 B = 0.0
                 a0 = 0.0
@@ -370,8 +392,14 @@ class GillespieSimulator:
                 if advanced_to_window_end:
                     continue
                 if B <= 0:
-                    extinct = True
-                    break
+                    # No reaction *in this window* does not imply an
+                    # absorbing state: treatment may begin in a later one.
+                    t_next = t_max if constant else t + horizon
+                    while rec_idx < len(t_record) and t_record[rec_idx] <= t_next:
+                        recorded[rec_idx] = state
+                        rec_idx += 1
+                    t = t_next
+                    continue
 
                 while rec_idx < len(t_record) and t_record[rec_idx] <= t_cand:
                     recorded[rec_idx] = state
@@ -387,11 +415,24 @@ class GillespieSimulator:
                 a0 = float(np.sum(propensities))
 
                 if a0 <= 0:
-                    extinct = True
-                    break
+                    t_next = t_max if constant else min(t + self.lookahead, next_boundary)
+                    while rec_idx < len(t_record) and t_record[rec_idx] <= t_next:
+                        recorded[rec_idx] = state
+                        rec_idx += 1
+                    t = t_next
+                    continue
 
                 tau = float(self.rng.exponential(1.0 / a0))
                 t_next = t + tau
+
+                # A known dose boundary invalidates a holding time drawn
+                # from the previous rates. Recompute there before firing.
+                if t_next >= next_boundary:
+                    while rec_idx < len(t_record) and t_record[rec_idx] <= next_boundary:
+                        recorded[rec_idx] = state
+                        rec_idx += 1
+                    t = next_boundary
+                    continue
 
                 # Record state at any t_record between t and t_next
                 while rec_idx < len(t_record) and t_record[rec_idx] <= t_next:

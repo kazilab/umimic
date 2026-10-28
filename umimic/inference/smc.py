@@ -43,6 +43,7 @@ from umimic.inference.likelihood import (
 )
 from umimic.observations.base import ObservationModel
 from umimic.observations.multimodal import MultimodalObservation
+from umimic.pk.exposure import ExposureProfile, shifted_exposure
 from umimic.types import MCMCResult
 
 if TYPE_CHECKING:
@@ -53,6 +54,10 @@ logger = logging.getLogger(__name__)
 
 class ParticleDegeneracyError(RuntimeError):
     """Raised when every particle has zero likelihood."""
+
+
+class ParticleBudgetExceeded(RuntimeError):
+    """Raised when propagation would exceed the caller's total event budget."""
 
 
 class ParticleFilter:
@@ -74,7 +79,15 @@ class ParticleFilter:
         max_events: int = 100_000,
         ess_fraction: float = 0.5,
         obs_params: dict[str, float] | None = None,
+        max_total_events: int | None = None,
     ):
+        """
+        Args:
+            max_total_events: Stop with :class:`ParticleBudgetExceeded` once
+                the simulated events of all particles exceed this, so a
+                caller can bound the cost of exact simulation. None: no bound.
+        """
+        self.max_total_events = max_total_events
         self.rate_set = rate_set
         self.topology = topology
         self.exposure_fn = exposure_fn
@@ -159,7 +172,11 @@ class ParticleFilter:
 
         Returns:
             Dict with filtered state estimates, weights, and log-likelihood.
-            ``marginal_log_likelihood`` is -inf on total degeneracy.
+            ``marginal_log_likelihood`` is -inf on total degeneracy. Also
+            ``viable_means`` and ``viable_vars`` (the weighted mean and
+            variance of the viable total, which per-state variances cannot
+            give), ``ess`` (effective sample size at each time, before any
+            resampling) and ``n_events`` (events simulated).
         """
         n = self.n_particles
         n_states = self.topology.n_states
@@ -178,6 +195,13 @@ class ParticleFilter:
 
         filtered_means = np.zeros((len(times), n_states))
         filtered_vars = np.zeros((len(times), n_states))
+        viable_means = np.zeros(len(times))
+        viable_vars = np.zeros(len(times))
+        ess_trace = np.full(len(times), np.nan)
+        viable_columns = np.array(
+            [ct is not CellType.A for ct in self.topology.active_states]
+        )
+        n_events = 0
 
         # One simulator, reused: rebuilding reactions per particle per step is
         # pure overhead.
@@ -198,10 +222,7 @@ class ParticleFilter:
 
                 # Shift the clock: the simulator integrates on [0, dt] but the
                 # exposure must be sampled at t_prev + s.
-                def shifted(s, _t0=t_prev):
-                    return self.exposure_fn(_t0 + s)
-
-                simulator.exposure_fn = shifted
+                simulator.exposure_fn = shifted_exposure(self.exposure_fn, t_prev)
 
                 new_particles = np.zeros_like(particles)
                 for i in range(n):
@@ -213,6 +234,14 @@ class ParticleFilter:
                     )
                     if result.metadata.get("truncated"):
                         truncated = True
+                    n_events += int(result.metadata.get("n_events", 0))
+                    if self.max_total_events is not None and n_events > self.max_total_events:
+                        raise ParticleBudgetExceeded(
+                            f"The particle filter passed its budget of "
+                            f"{self.max_total_events:,} simulated events at "
+                            f"t={t_now:.4g}. Use fewer particles, or the "
+                            "extended Kalman filter for large populations."
+                        )
                     for j, ct in enumerate(self.topology.active_states):
                         new_particles[i, j] = result.populations[ct.name][-1]
                 particles = new_particles
@@ -243,6 +272,8 @@ class ParticleFilter:
                 )
                 filtered_means[k:] = np.nan
                 filtered_vars[k:] = np.nan
+                viable_means[k:] = np.nan
+                viable_vars[k:] = np.nan
                 break
 
             # Incremental marginal likelihood contribution.
@@ -254,9 +285,13 @@ class ParticleFilter:
             filtered_vars[k] = np.average(
                 (particles - filtered_means[k]) ** 2, weights=weights, axis=0
             )
+            viable = particles[:, viable_columns].sum(axis=1)
+            viable_means[k] = np.average(viable, weights=weights)
+            viable_vars[k] = np.average((viable - viable_means[k]) ** 2, weights=weights)
 
             # Systematic resampling if ESS is low.
             ess = 1.0 / float(np.sum(weights**2))
+            ess_trace[k] = ess
             if ess < self.ess_fraction * n:
                 indices = self._systematic_resample(weights)
                 particles = particles[indices]
@@ -274,6 +309,10 @@ class ParticleFilter:
         return {
             "filtered_means": filtered_means,
             "filtered_vars": filtered_vars,
+            "viable_means": viable_means,
+            "viable_vars": viable_vars,
+            "ess": ess_trace,
+            "n_events": n_events,
             "marginal_log_likelihood": float(marginal_ll),
             "final_particles": particles,
             "final_weights": np.exp(log_weights),
@@ -369,6 +408,50 @@ class ParticleMCMC:
         base = rng or np.random.default_rng(42)
         self._proposal_rng, self._filter_rng = base.spawn(2)
 
+        # Set by from_likelihood: evaluate through a ModelLikelihood instead.
+        self._likelihood = None
+        self.max_total_events: int | None = None
+        self.events_used = 0
+
+    @classmethod
+    def from_likelihood(
+        cls,
+        likelihood,
+        priors: PriorSpec,
+        n_particles: int = 200,
+        rng: np.random.Generator | None = None,
+        max_total_events: int | None = None,
+    ) -> ParticleMCMC:
+        """PMCMC on the model a :class:`ModelLikelihood` describes.
+
+        The marginal likelihood is the sum, over every series of the
+        likelihood, of :meth:`ModelLikelihood.particle_filter` estimates. So
+        the chain targets the same model as the batch likelihood and MCMC:
+        sampled parameters over the configured base rates, each series' own
+        exposure (PK included), initial state and anchor, and every
+        observation model. The direct constructor instead rebuilds rates from
+        the sampled parameters alone, with a constant exposure, for one series.
+
+        ``max_total_events`` bounds the cell events simulated over the whole
+        run; past it, :class:`ParticleBudgetExceeded` is raised rather than a
+        proposal being rejected.
+        """
+        sampler = cls(
+            likelihood.topology,
+            likelihood.data_list[0],
+            likelihood.obs_model,
+            priors,
+            n_particles=n_particles,
+            rng=rng,
+            param_names=list(likelihood.param_names),
+            anchor_modality=likelihood.anchor_modality,
+            condition_on_first=likelihood.condition_on_first,
+            initial_fractions=likelihood.initial_fractions,
+        )
+        sampler._likelihood = likelihood
+        sampler.max_total_events = max_total_events
+        return sampler
+
     def _validate_param_names(self, names: list[str]) -> None:
         """Reject parameters the forward model would never read.
 
@@ -434,6 +517,7 @@ class ParticleMCMC:
         n_warmup: int = 500,
         proposal_scale: float = 0.01,
         initial_params: dict[str, float] | None = None,
+        progress: Callable[[str, int, int], None] | None = None,
     ) -> MCMCResult:
         """Run PMCMC sampling.
 
@@ -444,6 +528,8 @@ class ParticleMCMC:
                 strictly positive parameters, and to theta itself (in units of
                 the prior SD) for parameters whose prior admits zero.
             initial_params: Starting parameter values.
+            progress: Called after every iteration as
+                ``progress(phase, steps_done, steps_in_phase)``.
 
         Returns:
             MCMCResult with posterior samples, shaped (1, n_samples).
@@ -522,6 +608,11 @@ class ParticleMCMC:
                     samples[name].append(current[name])
                 ll_trace.append(current_ll)
                 lp_trace.append(current_ll + current_lp)
+            if progress is not None:
+                if iteration < n_warmup:
+                    progress("warmup", iteration + 1, n_warmup)
+                else:
+                    progress("production", iteration + 1 - n_warmup, n_samples)
 
         return MCMCResult(
             # Shape (n_chains=1, n_draws) so diagnostics see the chain axis.
@@ -537,6 +628,8 @@ class ParticleMCMC:
                 "acceptance_rate": n_accept / total_iter,
                 "backend": "particle_mcmc",
                 "n_particles": self.n_particles,
+                "n_events": self.events_used,
+                "series": 1 if self._likelihood is None else len(self._likelihood.data_list),
                 "param_names": param_names,
                 # Which parameters were sampled on the reflected linear scale
                 # because their prior admits zero.
@@ -561,10 +654,11 @@ class ParticleMCMC:
 
     def _particle_filter_ll(self, params: dict[str, float]) -> float:
         """Run the particle filter and return the marginal log-likelihood."""
+        if self._likelihood is not None:
+            return self._likelihood_ll(params)
         rate_set = build_rate_set(params)
         conc = self.data.concentration if self.data.concentration is not None else 0.0
-        def exposure_fn(t, _c=conc):
-            return _c
+        exposure_fn = ExposureProfile.constant(conc)
 
         pf = ParticleFilter(
             rate_set,
@@ -605,3 +699,31 @@ class ParticleMCMC:
             return -np.inf
 
         return result["marginal_log_likelihood"]
+
+    def _likelihood_ll(self, params: dict[str, float]) -> float:
+        """Sum of particle-filter estimates over every series of the likelihood.
+
+        Each series' estimate is unbiased and they are independent, so their
+        product is an unbiased estimate of the joint likelihood, as the
+        pseudo-marginal argument requires.
+        """
+        total = 0.0
+        for series in self._likelihood.data_list:
+            remaining = None
+            if self.max_total_events is not None:
+                remaining = self.max_total_events - self.events_used
+            try:
+                result = self._likelihood.particle_filter(
+                    params, series, self.n_particles, rng=self._filter_rng,
+                    max_total_events=remaining,
+                )
+            except ParticleBudgetExceeded:
+                raise
+            except (ValueError, RuntimeError) as exc:
+                logger.warning("Particle filter failed for %s: %s", params, exc)
+                return -np.inf
+            self.events_used += int(result["n_events"])
+            total += result["marginal_log_likelihood"]
+            if not np.isfinite(total):
+                return -np.inf
+        return total

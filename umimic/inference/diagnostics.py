@@ -295,30 +295,8 @@ def posterior_predictive_check(
         ok = True
 
         for conc, series in likelihood_fn._conc_groups.items():
-            times = likelihood_fn._group_times[conc]
-            if len(times) < 2:
-                continue
-            # Same initial-condition contract as ModelLikelihood: pass the
-            # rate set so "stable" (and any rate-dependent) fractions match
-            # the fitted model rather than falling back to pure-P.
-            initials = [
-                likelihood_fn._initial_state(d, rate_set) for d in series
-            ]
-            shared = all(np.allclose(x, initials[0]) for x in initials)
             try:
-                if shared:
-                    solutions = [
-                        likelihood_fn._solve_forward(
-                            rate_set, conc, times, initials[0]
-                        )
-                    ] * len(series)
-                else:
-                    solutions = [
-                        likelihood_fn._solve_forward(
-                            rate_set, conc, times, x0
-                        )
-                        for x0 in initials
-                    ]
+                solutions = likelihood_fn._forward_solutions(rate_set, conc, series)
             except (RuntimeError, ValueError):
                 ok = False
                 break
@@ -336,11 +314,7 @@ def posterior_predictive_check(
                     # variance into replicates when moment mode supplies it.
                     process_vars = None
                     if covs is not None and hasattr(model, "project_variance"):
-                        from umimic.inference.likelihood import (
-                            MODALITY_OBSERVABLE,
-                        )
-
-                        observable = MODALITY_OBSERVABLE.get(modality)
+                        observable = likelihood_fn._observable_for_modality(modality)
                         if observable is not None:
                             process_vars = np.asarray(
                                 model.project_variance(

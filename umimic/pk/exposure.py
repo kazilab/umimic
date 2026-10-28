@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 
@@ -10,6 +10,51 @@ from umimic.pk.dosing import DosingSchedule
 
 if TYPE_CHECKING:
     from umimic.pk.compartment import OneCompartmentPK, TwoCompartmentPK
+
+
+def _exposure_metadata(exposure_fn: Callable) -> object:
+    """Keep metadata available when a bound concentration method is passed."""
+    return getattr(exposure_fn, "__self__", None) or exposure_fn
+
+
+def is_constant_exposure(exposure_fn: Callable) -> bool:
+    """Return whether the caller explicitly guarantees a constant profile.
+
+    Sampling a finite set of times cannot establish this: an entire treatment
+    pulse can fall between the probes. Custom callables may set
+    ``is_constant = True`` when they can make the same guarantee.
+    """
+    return getattr(_exposure_metadata(exposure_fn), "is_constant", False) is True
+
+
+def exposure_breakpoints(
+    exposure_fn: Callable, t_start: float, t_end: float
+) -> np.ndarray:
+    """Known interior exposure boundaries, ordered in increasing time.
+
+    Custom profiles may implement ``breakpoints(t_start, t_end)`` to expose
+    discontinuities. Unknown callables have no inferred boundaries.
+    """
+    provider = getattr(_exposure_metadata(exposure_fn), "breakpoints", None)
+    if provider is None:
+        return np.empty(0, dtype=float)
+    points = np.asarray(provider(t_start, t_end), dtype=float)
+    if points.ndim != 1 or not np.all(np.isfinite(points)):
+        raise ValueError("Exposure breakpoints must be a finite 1-D array.")
+    low, high = sorted((t_start, t_end))
+    return np.unique(points[(points > low) & (points < high)])
+
+
+def shifted_exposure(exposure_fn: Callable, offset: float) -> Callable:
+    """Translate the clock while preserving constancy and dose boundaries."""
+    def shifted(t):
+        return exposure_fn(offset + t)
+
+    shifted.is_constant = is_constant_exposure(exposure_fn)
+    shifted.breakpoints = lambda start, end: (
+        exposure_breakpoints(exposure_fn, start + offset, end + offset) - offset
+    )
+    return shifted
 
 
 class ExposureProfile:
@@ -114,6 +159,26 @@ class ExposureProfile:
         self._cache_t = None
         self._cache_c = None
 
+    def breakpoints(self, t_start: float, t_end: float) -> np.ndarray:
+        """Dose/infusion boundaries and cached interpolation corners in hours.
+
+        Solvers must stop at scheduled changes even when the population is
+        stationary before treatment. Including cache knots also preserves the
+        opt-in piecewise-linear exposure supplied by :meth:`precompute`.
+        """
+        if self.is_constant:
+            return np.empty(0, dtype=float)
+        points = []
+        if self._dosing is not None:
+            for dose in self._dosing.doses:
+                points.append(dose.time)
+                if dose.route == "iv_infusion":
+                    points.append(dose.time + dose.duration)
+        if self._cache_t is not None:
+            points.extend(self._cache_t)
+        low, high = sorted((t_start, t_end))
+        return np.unique([p for p in points if low < p < high]).astype(float)
+
     @property
     def has_cache(self) -> bool:
         return self._cache_t is not None and self._cache_c is not None
@@ -201,4 +266,4 @@ class ExposureProfile:
 
     @property
     def is_constant(self) -> bool:
-        return self._constant is not None
+        return self._constant is not None or self._pk_model is None or self._dosing is None

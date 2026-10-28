@@ -121,6 +121,30 @@ class ExtendedKalmanFilter:
             observed.append((model, float(value)))
         return observed
 
+    @staticmethod
+    def _raise_unscorable(
+        model: ObservationModel,
+        value: float,
+        mu: np.ndarray,
+        params: dict | None,
+        t: float,
+    ) -> None:
+        """Explain why a reading with a finite state has no Gaussian update.
+
+        Not every such reading is censored. A non-positive reading with no
+        detection limit is invalid data, which the batch likelihood and the
+        particle filter reject as well; the model's own check says how to fix
+        it, so let it raise first. A reading the model can score is censored,
+        and only then do the censor-aware alternatives apply.
+        """
+        model.log_likelihood(value, mu, params)
+        raise ValueError(
+            f"The Gaussian EKF cannot score observation {value!r} at "
+            f"t={t:.4g} with {type(model).__name__}: it is at or below the "
+            "detection limit. Censored observations require a censor-aware "
+            "batch likelihood or particle filter."
+        )
+
     def filter(
         self,
         data: TimeSeriesData,
@@ -207,7 +231,17 @@ class ExtendedKalmanFilter:
             for model, value in self._observed_at(data, k, skip):
                 update = model.linearize(value, mu, params)
                 if update is None:
-                    continue
+                    if not np.all(np.isfinite(mu)):
+                        # A broken state, not a problem with the reading:
+                        # treat it like a failed moment solve.
+                        logger.warning(
+                            "Non-finite state mean at t=%.4g; the filter is "
+                            "invalid and reports -inf.", times[k],
+                        )
+                        diverged = True
+                        marginal_ll = -np.inf
+                        break
+                    self._raise_unscorable(model, value, mu, params, times[k])
                 h = np.asarray(update.H, dtype=float).ravel()
                 innov = update.z - update.z_pred
                 S = float(h @ Sigma @ h) + update.R

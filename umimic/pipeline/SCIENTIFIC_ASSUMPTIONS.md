@@ -19,8 +19,8 @@ the **wiring contract**.
 4. **Fit** via MLE or emcee MCMC using the same likelihood contracts as
    `umimic.inference`.
 
-CLI entry: `umimic.pipeline.runner`. Results are summarized to JSON; full MCMC
-chains are not archived by default.
+CLI entry: `umimic.pipeline.runner`. Result JSON includes summaries, full MCMC
+chains and traces, and the effective configuration, version, seed and data hash.
 
 ---
 
@@ -148,10 +148,10 @@ contexts.
 
 ## 9. Results IO
 
-`save_result` writes method, context, point estimates, MLE stats, and MCMC
-**summaries** (mean, std, 95% CI, diagnostics) — not full sample arrays.
-`load_result` returns a plain dict. For full chain plots, keep the live
-`MCMCResult` or extend serialization.
+`save_result` writes method, context, point estimates, MLE stats, MCMC summaries,
+full posterior sample arrays and likelihood/posterior traces. Pipeline results
+include the effective config, package version, seed and an observation hash.
+`load_result` returns a plain dict.
 
 ---
 
@@ -173,5 +173,5 @@ contexts.
 
 - Automatic model selection across topologies.
 - That default baseline rates are cell-line-specific truth.
-- Full posterior archiving or experiment database.
+- An experiment database.
 - Joint in vitro / in vivo hierarchical sampling (transfer is prior construction).

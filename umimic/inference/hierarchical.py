@@ -20,8 +20,12 @@ import logging
 
 import numpy as np
 
+from collections.abc import Callable
+
 from umimic.data.schemas import ExperimentalDataset
+from umimic.dynamics.rates import RateSet
 from umimic.dynamics.states import ModelTopology
+from umimic.inference.checkpoint import MCMCCheckpoint
 from umimic.inference.likelihood import ModelLikelihood
 from umimic.inference.priors import PriorSpec
 from umimic.observations.base import ObservationModel
@@ -65,6 +69,8 @@ class HierarchicalModel:
         initial_fractions=None,
         max_abs_z: float = 8.0,
         max_log_deviation: float = 5.0,
+        exposure_fn: Callable[[float], float] | None = None,
+        base_rate_set: RateSet | None = None,
     ):
         """
         Args:
@@ -98,6 +104,13 @@ class HierarchicalModel:
         The last three used to be left at their defaults, so a hierarchical fit
         could not be configured to match a ModelLikelihood or ParticleMCMC fit
         of the same data -- which made the two silently non-comparable.
+
+            exposure_fn: Experiment-time concentration profile (PK), forwarded
+                to each group's ModelLikelihood; None uses each series' constant
+                concentration.
+            base_rate_set: Configured fixed rates and drug response, forwarded
+                likewise, so parameters not sampled keep their configured values
+                instead of package defaults.
         """
         if not shared_params and not random_effect_params:
             raise ValueError("At least one parameter must be shared or group-varying.")
@@ -154,6 +167,8 @@ class HierarchicalModel:
                 condition_on_first=condition_on_first,
                 anchor_modality=anchor_modality,
                 initial_fractions=initial_fractions,
+                exposure_fn=exposure_fn,
+                base_rate_set=base_rate_set,
             )
             for series in dataset.series
         ]
@@ -353,8 +368,13 @@ class HierarchicalModel:
         n_samples: int = 2000,
         n_warmup: int = 1000,
         n_walkers: int | None = None,
+        checkpoint: MCMCCheckpoint | None = None,
+        progress: Callable[[str, int, int], None] | None = None,
     ) -> MCMCResult:
         """Fit the hierarchical model using emcee.
+
+        ``checkpoint`` and ``progress`` work as in :meth:`MCMCSampler.sample`:
+        the run saves as it goes and a matching saved run resumes exactly.
 
         Returns:
             MCMCResult with population- and group-level posterior samples,
@@ -381,13 +401,28 @@ class HierarchicalModel:
             self._log_posterior_blobs,
             blobs_dtype=[("log_likelihood", float)],
         )
-        sampler.random_state = np.random.RandomState(
-            int(self.rng.integers(0, 2**32 - 1))
-        ).get_state()
+        seed = int(self.rng.integers(0, 2**32 - 1))
+        sampler.random_state = np.random.RandomState(seed).get_state()
 
-        state = sampler.run_mcmc(p0, n_warmup, progress=False)
-        sampler.reset()
-        sampler.run_mcmc(state, n_samples, progress=False)
+        from umimic import __version__
+        from umimic.inference.mcmc import _run_phases
+
+        run_identity = {
+            **(checkpoint.identity if checkpoint is not None else {}),
+            "sampler": {
+                "hierarchical": True,
+                "labels": self._parameter_labels(),
+                "n_walkers": n_walkers,
+                "n_warmup": n_warmup,
+                "n_samples": n_samples,
+                "seed": seed,
+                "emcee": emcee.__version__,
+                "umimic": __version__,
+            },
+        }
+        resumed, missed_saves = _run_phases(
+            emcee, sampler, p0, n_warmup, n_samples, checkpoint, run_identity, progress
+        )
 
         # Keep the walker axis: flattening it destroys the information R-hat
         # and ESS need, and emcee walkers are not independent chains.
@@ -426,6 +461,17 @@ class HierarchicalModel:
                 "acceptance": float(np.mean(sampler.acceptance_fraction)),
                 "walkers_are_independent_chains": False,
                 "group_labels": list(self.group_labels),
+                "shared_params": list(self.shared_params),
+                "random_effect_params": list(self.random_effect_params),
+                **(
+                    {
+                        "resumed_from": resumed,
+                        "checkpoint_discarded": checkpoint.discarded,
+                        "checkpoint_save_failures": missed_saves,
+                    }
+                    if checkpoint is not None
+                    else {}
+                ),
             },
         )
 

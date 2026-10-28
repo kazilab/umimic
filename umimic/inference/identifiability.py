@@ -39,6 +39,10 @@ class IdentifiabilityReport:
     #: Right singular vectors of the near-null directions.
     null_directions: np.ndarray = field(default_factory=lambda: np.zeros((0, 0)))
     threshold: float = 1e-6
+    #: The observed information on log parameters, when the analysis built
+    #: one (:func:`likelihood_identifiability`); its pseudo-inverse
+    #: approximates the covariance of log(theta).
+    information: np.ndarray | None = None
 
     @property
     def n_identifiable(self) -> int:
@@ -289,4 +293,11 @@ def likelihood_identifiability(
         scores=scores,
         null_directions=null,
         threshold=threshold,
+        information=_psd(fisher),
     )
+
+
+def _psd(matrix: np.ndarray) -> np.ndarray:
+    """The matrix with negative eigenvalues clipped to zero, as in the scores."""
+    eigenvalues, eigenvectors = np.linalg.eigh((matrix + matrix.T) / 2.0)
+    return eigenvectors @ np.diag(np.maximum(eigenvalues, 0.0)) @ eigenvectors.T

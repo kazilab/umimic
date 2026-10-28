@@ -13,12 +13,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import subprocess
 import urllib.request
 import zipfile
 from pathlib import Path
 
-DATA_DIR = Path(__file__).parent
+DATA_DIR = Path(os.environ.get("UMIMIC_DATA_ROOT") or Path(__file__).parent).expanduser().resolve()
 
 
 def download_file(url: str, dest: Path, desc: str = "") -> Path:
@@ -44,7 +45,7 @@ def download_bestdr() -> None:
     and extract the data files. If R is available, we convert to CSV.
     """
     dest = DATA_DIR / "bestdr"
-    dest.mkdir(exist_ok=True)
+    dest.mkdir(parents=True, exist_ok=True)
 
     repo_url = "https://github.com/olliemcdonald/bestdr.git"
     clone_dir = dest / "bestdr_repo"
@@ -136,7 +137,7 @@ def download_phenopop() -> None:
           (imatinib sensitive and resistant) at 11 concentrations.
     """
     dest = DATA_DIR / "phenopop"
-    dest.mkdir(exist_ok=True)
+    dest.mkdir(parents=True, exist_ok=True)
 
     repo_url = "https://github.com/chenyuwu233/PhenoPop_stochastic.git"
     clone_dir = dest / "phenopop_repo"
@@ -248,7 +249,7 @@ def download_tshs_tumor() -> None:
     cells). Automatic HTTP download is best-effort only.
     """
     dest = DATA_DIR / "tshs_tumor"
-    dest.mkdir(exist_ok=True)
+    dest.mkdir(parents=True, exist_ok=True)
 
     xlsx = dest / "tumorgrowth.xlsx"
     product = dest / "tshs_tumor_umimic.csv.xz"
@@ -365,7 +366,7 @@ def download_hafner_gr() -> None:
           parameters for 71 breast cancer cell lines x 107 drugs.
     """
     dest = DATA_DIR / "hafner_gr"
-    dest.mkdir(exist_ok=True)
+    dest.mkdir(parents=True, exist_ok=True)
 
     # Dryad dataset DOI - the actual download URL may vary
     print("  The Hafner/Niepel GR dataset is hosted on Dryad.")

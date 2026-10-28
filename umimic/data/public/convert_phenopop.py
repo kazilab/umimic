@@ -19,8 +19,10 @@ from pathlib import Path
 import numpy as np
 from scipy.io import loadmat
 
+from umimic.data.public_datasets import _resolve_default_data_root
 
-DATA_DIR = Path(__file__).parent / "phenopop"
+
+DATA_DIR = _resolve_default_data_root() / "phenopop"
 REPO_DIR = DATA_DIR / "phenopop_repo" / "In vitro experiment"
 OUT_DIR = DATA_DIR / "converted"
 

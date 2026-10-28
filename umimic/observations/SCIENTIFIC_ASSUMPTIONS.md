@@ -84,20 +84,32 @@ less overdispersion (Poisson limit \(\phi\to\infty\)).
 **Moment mode with LNA process variance** \(V = H\Sigma H^\top\):
 
 \[
-Y \approx \mathcal{N}\!\bigl(\mu,\; V + \mu + \mu^2/\phi\bigr).
+Y \sim \mathrm{NegBin}(\mu, \phi_{\mathrm{eff}}), \qquad
+\phi_{\mathrm{eff}} = \frac{\mu^2}{V + \mu^2/\phi}, \qquad
+\mathrm{Var}(Y) = V + \mu + \mu^2/\phi.
 \]
 
-This is the law of total variance: process variance of the latent mean plus
-conditional observation variance. Matching the first two moments does **not**
-make a Gaussian a NegBin. At small \(\mu\) (\(\lesssim 20\)) the Gaussian
-puts mass below zero and lacks skew; a one-time warning is issued. Prefer
-`mode="ode"` or a particle filter for low-count data.
+The total variance is the law of total variance: process variance of the
+latent mean plus conditional observation variance. Lowering the NegBin size
+to \(\phi_{\mathrm{eff}}\) carries it while keeping the law discrete and
+right-skewed; a Gaussian matching the first two moments would drop the third,
+and moment mode would absorb that misfit into the process variance. The
+Gaussian \(\mathcal{N}(\mu,\, V + \mu + \mu^2/\phi)\) is used only below the
+Poisson floor (total variance \(\le \mu\)) or with
+`moment_family="gaussian"`. The fused multimodal path is always Gaussian
+(there is no tractable multivariate NegBin), so set `moment_family="gaussian"`
+when a single-modality diagnostic must line up with it.
+
+One-time warnings fire when \(\mu < 20\), where the LNA itself is unreliable,
+and when the skew of the total distribution exceeds 0.2, which is set by
+\(\phi\) rather than by \(\mu\). Prefer `mode="ode"` or a particle filter for
+low-count data.
 
 ### Sampling
 
-Matches the likelihood branch: NegBin without process variance; Gaussian with
-total variance (clipped at 0) when process variance is provided. Free
-parameter key: **`overdispersion`**.
+Matches the likelihood branch: NegBin(\(\mu, \phi\)) without process variance;
+NegBin(\(\mu, \phi_{\mathrm{eff}}\)) with it, or a Gaussian clipped at 0 where
+the likelihood also uses one. Free parameter key: **`overdispersion`**.
 
 ### EKF
 

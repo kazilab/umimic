@@ -41,15 +41,7 @@ def _resolve_default_data_root() -> Path:
     """
     env_root = os.getenv("UMIMIC_DATA_ROOT")
     if env_root:
-        resolved = Path(env_root).expanduser().resolve()
-        if not resolved.exists():
-            warnings.warn(
-                f"UMIMIC_DATA_ROOT is set to '{resolved}' but the directory "
-                f"does not exist. Falling back to package-local data directory.",
-                stacklevel=2,
-            )
-            return Path(__file__).resolve().parent / "public"
-        return resolved
+        return Path(env_root).expanduser().resolve()
 
     return Path(__file__).resolve().parent / "public"
 
@@ -583,6 +575,8 @@ def load_phenopop(
         )
         if population is not None:
             key = population.lower()
+            if key in ("mixed", "mixture"):
+                key = "mix"
             ds = ExperimentalDataset(
                 series=[
                     s for s in ds.series
@@ -1285,6 +1279,39 @@ def _read_nci60_filtered(
     return pd.concat(pieces, ignore_index=True)
 
 
+def nci60_index(
+    data_path: str | Path | None = None,
+    *,
+    data_root: Path | None = None,
+):
+    """NSC, cell line and panel of each series :func:`load_nci60` can build.
+
+    One row per (cell line, NSC, concentration), the series of the default
+    ``aggregate="mean"``, read from four columns without building any series.
+    It lets a caller count a filtered load before running it; series that
+    ``load_nci60`` later drops (for example below ``min_endpoint_count``) are
+    still listed, so a count is an upper bound.
+
+    Returns:
+        pandas DataFrame with string columns ``NSC``, ``cell_line``, ``panel``.
+    """
+    try:
+        import pandas as pd
+    except ImportError as exc:
+        raise ImportError(
+            "pandas is required to index NCI-60 data. Install pandas: pip install pandas"
+        ) from exc
+
+    path = _resolve_nci60_product(data_path, data_root)
+    wanted = {"NSC", "cell_line", "panel", "concentration_log10M"}
+    frame = pd.read_csv(path, usecols=lambda column: column in wanted, dtype=str)
+    if "panel" not in frame.columns:
+        frame["panel"] = ""
+    frame["NSC"] = frame["NSC"].str.replace(r"\.0$", "", regex=True)
+    frame = frame.drop_duplicates(["cell_line", "NSC", "concentration_log10M"])
+    return frame[["NSC", "cell_line", "panel"]].fillna("").reset_index(drop=True)
+
+
 def load_nci60(
     data_path: str | Path | None = None,
     cell_line: str | None = None,
@@ -1545,14 +1572,11 @@ def _load_long_csv(
     try:
         import pandas as pd
         df = pd.read_csv(path)
-    except ImportError:
-        # Numpy fallback
-        data = np.genfromtxt(path, delimiter=",", names=True, dtype=None, encoding=None)
-        ts = TimeSeriesData(
-            times=data[time_col].astype(float),
-            observations={"cell_counts": data[count_col].astype(float)},
-        )
-        return ExperimentalDataset(series=[ts], name=dataset_name, context=context)
+    except ImportError as exc:
+        raise ImportError(
+            "pandas is required to load public dataset products. "
+            "Install pandas: pip install pandas"
+        ) from exc
 
     # Flexible column matching
     cols = {c.lower(): c for c in df.columns}

@@ -20,6 +20,11 @@ same pipeline:
 3. Solve the forward model (`mode="moment"` LNA or `mode="ode"` mean field).
 4. Score every **configured and present** modality at each non-missing time.
 
+`ModelLikelihood(exposure_fn=...)` evaluates a supplied exposure profile on
+absolute experiment time. Without one, exposure is the series' constant
+concentration. `base_rate_set=...` retains configured fixed rate components;
+free parameters override only their corresponding components on a copy.
+
 A second, partial copy of the parameter → rate wiring is treated as a
 critical failure mode: names would be sampled but never read, returning their
 prior while other parameters absorb the misfit. That is why
@@ -134,7 +139,17 @@ available, is projected as \(H\Sigma H^\top\) onto that modality’s observable
 Series that share a concentration share one forward solve on the **union** of
 their observation times. Each replicate is scored at its own times by exact
 grid membership (no nearest-neighbour snap). Different measured initial
-counts force separate solves.
+counts or anchor times force separate solves. Leading missing anchor rows do
+not move the measured initial state to an earlier time. Scored observations
+before a future anchor are rejected because a forward model cannot condition
+them on that future state. A single-timepoint series is scored when its
+observation is not consumed by conditioning.
+
+Censored BLI/volume readings use their scalar log-CDF likelihood, including
+positive readings below the detection limit. A point containing a censored
+modality declines Gaussian joint fusion and uses the scalar observation laws;
+this fallback approximates shared process correlation by marginal variances.
+No supplied modality is omitted when a Gaussian linearization is unavailable.
 
 ### Initial condition and the anchor
 
@@ -227,6 +242,14 @@ Failed solves or rate-law rejections (invalid Hill parameters, etc.) return
 - Modalities without a Gaussian linearization are **rejected at
   construction** (no silent drop).
 - Failed moment solve → `diverged=True`, marginal LL \(=-\infty\).
+- A reading at or below the detection limit raises an error; the Gaussian EKF
+  does not silently discard it. Use the censor-aware batch likelihood or
+  particle filtering for such observations.
+- A non-positive reading with no detection limit is invalid data, not a
+  censored one, and raises the observation model's own error: set `lod` or
+  mark the point NaN.
+- A non-finite state mean at an update → `diverged=True`, marginal LL
+  \(=-\infty\), as for a failed moment solve.
 - Pass `anchor_modality` / `anchor_index` when \(\mu_0\) was seeded from data
   so the anchor is not scored twice (parity with `ModelLikelihood`).
 

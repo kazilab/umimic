@@ -146,9 +146,10 @@ class MultimodalObservation:
                 continue
             update = model.linearize(float(value), latent_state, params.get(name))
             if update is None:
-                # No Gaussian approximation (e.g. biomarker fractions). Such a
-                # modality is not fused here; the caller scores it exactly.
-                continue
+                # A censored/otherwise non-Gaussian observation cannot enter
+                # this density. Decline the whole fusion so the caller scores
+                # every supplied observation with its censor-aware scalar law.
+                return None
             names.append(name)
             z.append(update.z)
             z_pred.append(update.z_pred)

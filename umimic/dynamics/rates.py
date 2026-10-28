@@ -715,6 +715,7 @@ class RateSet:
         """
         # Deferred import: ode_system depends on this module.
         from umimic.dynamics.ode_system import CellDynamicsODE
+        from umimic.pk.exposure import ExposureProfile
 
         if duration <= 0:
             raise ValueError(f"duration must be positive, got {duration}.")
@@ -732,7 +733,7 @@ class RateSet:
             raise ValueError("initial_state has no viable cells.")
 
         def endpoint(conc: float) -> float:
-            ode = CellDynamicsODE(self, topology, lambda _t, _c=conc: _c)
+            ode = CellDynamicsODE(self, topology, ExposureProfile.constant(conc))
             result = ode.solve(
                 initial_state, (0.0, duration), np.array([0.0, duration])
             )

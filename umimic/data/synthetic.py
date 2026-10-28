@@ -10,9 +10,12 @@ from umimic.dynamics.states import ModelTopology
 from umimic.dynamics.rates import RateSet
 from umimic.dynamics.gillespie import GillespieSimulator
 from umimic.dynamics.ode_system import CellDynamicsODE
+from umimic.dynamics.initialization import integer_initial_state
+from umimic.pk.exposure import ExposureProfile
 from umimic.observations.base import ObservationModel, TopologyAwareObservation
 from umimic.observations.cell_counts import CellCountObservation
 from umimic.data.schemas import TimeSeriesData, ExperimentalDataset
+from umimic.time_grid import observation_grid, validate_observation_times
 
 
 class SyntheticDataGenerator:
@@ -91,6 +94,35 @@ class SyntheticDataGenerator:
                 )
         return observations
 
+    def _simulate(self, initial_cells, exposure_fn, t_max, times, method):
+        if method == "ode":
+            return CellDynamicsODE(
+                self.rate_set, self.topology, exposure_fn
+            ).solve(initial_cells, (0, t_max), times)
+        initial_cells = integer_initial_state(initial_cells, self.rng)
+        if method == "gillespie":
+            result = GillespieSimulator(
+                self.rate_set, self.topology, exposure_fn, self.rng
+            ).simulate(initial_cells, t_max, times)
+        elif method == "tau_leaping":
+            from umimic.dynamics.tau_leaping import TauLeapingSimulator
+
+            result = TauLeapingSimulator(
+                self.rate_set, self.topology, exposure_fn, rng=self.rng
+            ).simulate(initial_cells, t_max, times)
+        else:
+            raise ValueError(f"Unknown simulation method: {method!r}")
+        if result.metadata.get("truncated"):
+            # Observations after the stop would sample a frozen state.
+            reached = result.metadata.get("t_reached")
+            where = "" if reached is None else f" at t={reached:.4g}"
+            raise RuntimeError(
+                f"{method} simulation hit its event limit{where} before "
+                f"t_max={t_max:.4g}, so no synthetic data was generated. Use "
+                "tau_leaping or ode, or a smaller initial population or horizon."
+            )
+        return result
+
     def generate_invitro_plate(
         self,
         initial_cells: np.ndarray | None = None,
@@ -100,6 +132,7 @@ class SyntheticDataGenerator:
         dt_obs: float = 4.0,
         method: str = "gillespie",
         modalities: list[str] | None = None,
+        obs_times: np.ndarray | None = None,
     ) -> ExperimentalDataset:
         """Simulate a typical in vitro dose-response plate experiment.
 
@@ -127,29 +160,17 @@ class SyntheticDataGenerator:
         if concentrations is None:
             concentrations = [0, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0]
 
-        t_record = np.arange(0, t_max + dt_obs, dt_obs)
+        t_record = (
+            observation_grid(t_max, dt_obs) if obs_times is None
+            else validate_observation_times(obs_times, t_max)
+        )
         series = []
 
         for conc in concentrations:
-            def exposure_fn(t, c=conc):
-                return c
+            exposure_fn = ExposureProfile.constant(conc)
 
             for well_idx in range(n_wells_per_dose):
-                if method == "gillespie":
-                    sim = GillespieSimulator(
-                        self.rate_set, self.topology, exposure_fn, self.rng
-                    )
-                    result = sim.simulate(initial_cells, t_max, t_record)
-                elif method == "ode":
-                    ode = CellDynamicsODE(self.rate_set, self.topology, exposure_fn)
-                    result = ode.solve(initial_cells, (0, t_max), t_record)
-                else:
-                    from umimic.dynamics.tau_leaping import TauLeapingSimulator
-
-                    sim = TauLeapingSimulator(
-                        self.rate_set, self.topology, exposure_fn, rng=self.rng
-                    )
-                    result = sim.simulate(initial_cells, t_max, t_record)
+                result = self._simulate(initial_cells, exposure_fn, t_max, t_record, method)
 
                 # Generate noisy observations from the latent trajectory,
                 # using the configured observation models.
@@ -207,25 +228,19 @@ class SyntheticDataGenerator:
             initial_cells[0] = 1000  # larger initial tumor
 
         if exposure_fn is None:
-            def exposure_fn(t):  # vehicle control
-                return 0.0
+            exposure_fn = ExposureProfile.constant(0.0)
 
         if obs_times is None:
             # Typical in vivo: measure twice per week for 4 weeks
-            obs_times = np.array([0, 72, 168, 240, 336, 408, 504, 576, 672])
+            default_times = np.array([0, 72, 168, 240, 336, 408, 504, 576, 672])
+            obs_times = np.append(default_times[default_times < t_max], t_max)
+        obs_times = validate_observation_times(obs_times, t_max)
 
         modalities = self._resolve_modalities(modalities)
 
         series = []
         for animal_idx in range(n_animals):
-            if method == "gillespie":
-                sim = GillespieSimulator(
-                    self.rate_set, self.topology, exposure_fn, self.rng
-                )
-                result = sim.simulate(initial_cells, t_max, obs_times)
-            else:
-                ode = CellDynamicsODE(self.rate_set, self.topology, exposure_fn)
-                result = ode.solve(initial_cells, (0, t_max), obs_times)
+            result = self._simulate(initial_cells, exposure_fn, t_max, obs_times, method)
 
             # Draw from the configured observation models rather than
             # re-deriving each modality here. The inlined formulas this

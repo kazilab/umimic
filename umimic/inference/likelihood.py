@@ -39,6 +39,9 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from copy import deepcopy
+from dataclasses import replace
+from typing import Callable
 
 import numpy as np
 from scipy.special import logsumexp
@@ -48,9 +51,12 @@ from umimic.dynamics.moment_equations import MomentODE
 from umimic.dynamics.ode_system import CellDynamicsODE
 from umimic.dynamics.rates import EmaxHill, RateSet
 from umimic.dynamics.states import CellType, ModelTopology
+from umimic.inference.kalman import ExtendedKalmanFilter
 from umimic.observations.base import ObservationModel, TopologyAwareObservation
 from umimic.observations.cell_counts import CellCountObservation
 from umimic.observations.multimodal import MultimodalObservation
+from umimic.pk.exposure import ExposureProfile
+from umimic.types import FilterResult
 
 logger = logging.getLogger(__name__)
 
@@ -452,6 +458,8 @@ class ModelLikelihood:
         anchor_modality: str = "cell_counts",
         initial_fractions=None,
         n_quadrature: int = 9,
+        exposure_fn: Callable[[float], float] | None = None,
+        base_rate_set: RateSet | None = None,
     ):
         """
         Args:
@@ -471,6 +479,10 @@ class ModelLikelihood:
                 docstring); "stable" uses the relaxed state distribution;
                 a dict or array gives explicit fractions. A per-series
                 override may be supplied as metadata["initial_fractions"].
+            exposure_fn: Optional experiment-time concentration profile. When
+                omitted each series uses its constant ``concentration``.
+            base_rate_set: Configured fixed rates and drug response. Sampled
+                parameters override only the corresponding rate components.
         """
         self.topology = topology
         self.data_list = data if isinstance(data, list) else [data]
@@ -479,6 +491,8 @@ class ModelLikelihood:
         self.condition_on_first = condition_on_first
         self.anchor_modality = anchor_modality
         self.initial_fractions = initial_fractions
+        self.exposure_fn = exposure_fn
+        self.base_rate_set = base_rate_set
         # Gauss-Hermite nodes for integrating out `sigma_extrinsic`. Only
         # used when that parameter is present and positive.
         if n_quadrature < 3 or n_quadrature % 2 == 0:
@@ -538,6 +552,16 @@ class ModelLikelihood:
                 f"observation model provides {sorted(self._modality_models)}."
             )
         logger.debug("Likelihood active modalities: %s", self._active_modalities)
+        for series in self.data_list:
+            initial_time = self._initial_time(series)
+            for modality in self._active_modalities:
+                if np.any(self.scored_mask(series, modality) & (series.times < initial_time)):
+                    raise ValueError(
+                        "Observations before the initial anchor cannot be "
+                        "predicted by a forward model. Supply an initial "
+                        "state at the first observation time or remove the "
+                        "earlier observations."
+                    )
 
     # ------------------------------------------------------------------
     # Parameter handling
@@ -573,6 +597,10 @@ class ModelLikelihood:
 
     def _missing_state_params(self, names: set[str]) -> list[str]:
         """Active states whose rates the parameter vector does not describe."""
+        names = set(names)
+        if self.base_rate_set is not None:
+            names.update(f"b0_{state.name}" for state in self.base_rate_set.birth_base_by_state)
+            names.update(f"d0_{state.name}" for state in self.base_rate_set.death_base)
         return missing_state_params(self.topology, names)
 
     def _check_states_are_parameterised(self) -> None:
@@ -592,6 +620,7 @@ class ModelLikelihood:
             CellType.Q in self.topology.death_states
             and "d0_Q" not in names
             and "d0_P" in names
+            and (self.base_rate_set is None or CellType.Q not in self.base_rate_set.death_base)
         ):
             # The fallback is a modelling choice, not a neutral default: it
             # asserts quiescent cells die at exactly half the proliferating
@@ -630,7 +659,64 @@ class ModelLikelihood:
 
     def _build_rate_set(self, params: dict[str, float]) -> RateSet:
         """Construct a RateSet from parameter values."""
-        return build_rate_set(params)
+        sampled = build_rate_set(params)
+        if self.base_rate_set is None:
+            return sampled
+
+        rates = deepcopy(self.base_rate_set)
+        if "b0" in params:
+            rates.birth_base = sampled.birth_base
+        if "clearance_rate" in params:
+            rates.clearance_rate = sampled.clearance_rate
+        for state in (CellType.P, CellType.Q, CellType.R):
+            if f"d0_{state.name}" in params:
+                rates.death_base[state] = sampled.death_base[state]
+            if f"b0_{state.name}" in params:
+                rates.birth_base_by_state[state] = sampled.birth_base_by_state[state]
+                if state not in rates.birth_modulation_by_state:
+                    rates.birth_modulation_by_state[state] = None
+
+        def overlay_hill(existing, emax_key, ec50_key, hill_key):
+            if emax_key in params:
+                efficacy = params[emax_key]
+                if efficacy == 0:
+                    return None
+            elif isinstance(existing, EmaxHill):
+                efficacy = existing.emax
+            else:
+                return existing
+            return EmaxHill(
+                emax=efficacy,
+                ec50=params.get(ec50_key, getattr(existing, "ec50", 1.0)),
+                hill=params.get(hill_key, getattr(existing, "hill", 1.5)),
+            )
+
+        rates.birth_modulation = overlay_hill(
+            rates.birth_modulation, "emax_birth", "ec50_birth", "hill_birth"
+        )
+        for state, key in ((CellType.P, "emax_death"),
+                           (CellType.Q, "emax_death_Q"),
+                           (CellType.R, "emax_death_R")):
+            rates.death_modulation[state] = overlay_hill(
+                rates.death_modulation.get(state), key, "ec50_death", "hill_death"
+            )
+        for key, edge in (
+            ("u_PQ", (CellType.P, CellType.Q)),
+            ("u_QP", (CellType.Q, CellType.P)),
+            ("u_PR", (CellType.P, CellType.R)),
+            ("u_QR", (CellType.Q, CellType.R)),
+            ("u_RQ", (CellType.R, CellType.Q)),
+        ):
+            if key in params:
+                rates.transition_base[edge] = sampled.transition_base[edge]
+        for key, edge in (("induced_PQ", (CellType.P, CellType.Q)),
+                          ("induced_QR", (CellType.Q, CellType.R))):
+            rates.transition_induction[edge] = overlay_hill(
+                rates.transition_induction.get(edge), key,
+                "ec50_induction", "hill_induction",
+            )
+        rates._validate_modulators()
+        return rates
 
     # ------------------------------------------------------------------
     # Forward model
@@ -666,35 +752,181 @@ class ModelLikelihood:
             self.topology, data, self.initial_fractions, rate_set
         )
 
+    def _initial_time(self, data: TimeSeriesData) -> float:
+        """Time at which the series' initial state was measured."""
+        if data.has_modality(self.anchor_modality):
+            present = np.flatnonzero(data.observed_mask(self.anchor_modality))
+            if present.size:
+                return float(data.times[present[0]])
+        return float(data.times[0])
+
+    def _forward_solutions(self, rate_set: RateSet, conc: float, series):
+        """Solve once per distinct initial state and its actual anchor time."""
+        groups = {}
+        for index, data in enumerate(series):
+            mu0 = self._initial_state(data, rate_set)
+            initial_time = self._initial_time(data)
+            key = (initial_time, tuple(mu0))
+            groups.setdefault(key, []).append(index)
+
+        solutions = [None] * len(series)
+        for (initial_time, state), indices in groups.items():
+            times = np.unique(np.concatenate([series[i].times for i in indices]))
+            solution = self._solve_forward(
+                rate_set, conc, times, np.asarray(state), initial_time=initial_time
+            )
+            for index in indices:
+                solutions[index] = solution
+        return solutions
+
     def _solve_forward(
         self,
         rate_set: RateSet,
         conc: float,
         times: np.ndarray,
         mu0: np.ndarray,
+        initial_time: float | None = None,
     ):
         """Solve the forward model for one concentration on the union grid.
 
         Returns:
-            (means_fn, covs_fn) callables mapping a time array to the mean
-            trajectory and (for moment mode) the projected covariances.
+            (times, means, covariances) on the requested grid; covariances are
+            None in deterministic mode.
         """
-        def exposure_fn(t, _c=conc):
-            return _c
+        exposure_fn = self.exposure_fn
+        if exposure_fn is None:
+            exposure_fn = ExposureProfile.constant(conc)
 
-        t_span = (float(times[0]), float(times[-1]))
+        initial_time = float(times[0]) if initial_time is None else initial_time
+        future = times >= initial_time
+        solve_times = times[future]
+        # Rows preceding a late anchor are unobserved for this series. Keep
+        # them on the union grid for exact indexing, but never evolve the
+        # anchored state from that earlier clock time.
+        means = np.tile(mu0, (len(times), 1))
+        covs = (
+            np.tile(np.diag(np.maximum(mu0, 1.0)), (len(times), 1, 1))
+            if self.mode == "moment" else None
+        )
+        if not solve_times.size or solve_times[-1] == initial_time:
+            return times, means, covs
+
+        t_span = (initial_time, float(solve_times[-1]))
 
         if self.mode == "moment":
             moment_ode = MomentODE(rate_set, self.topology, exposure_fn)
-            t_sol, means, covs = moment_ode.solve(mu0, t_span=t_span, t_eval=times)
-            return t_sol, means, covs
+            _, solved_means, solved_covs = moment_ode.solve(
+                mu0, t_span=t_span, t_eval=solve_times
+            )
+            means[future] = solved_means
+            covs[future] = solved_covs
+            return times, means, covs
 
         ode = CellDynamicsODE(rate_set, self.topology, exposure_fn)
-        result = ode.solve(mu0, t_span, times)
-        means = np.column_stack(
+        result = ode.solve(mu0, t_span, solve_times)
+        means[future] = np.column_stack(
             [result.populations[ct.name] for ct in self.topology.active_states]
         )
-        return result.times, means, None
+        return times, means, None
+
+    def kalman_filter(self, params: dict[str, float], data: TimeSeriesData) -> FilterResult:
+        """Extended Kalman filter for one series at these parameter values.
+
+        Uses what the batch likelihood uses -- rates built from ``params`` over
+        the configured base rates, the series' exposure, its initial state and
+        anchor, and every configured observation model -- so the filtered
+        states belong to the model this likelihood scores. The filter always
+        propagates the LNA moments, whatever ``mode`` is, and starts at the
+        series' anchor time; with ``condition_on_first`` the anchor reading
+        places the initial state and is not scored again.
+
+        Not represented: the between-replicate effect ``sigma_extrinsic`` and
+        per-time paired tumour volumes for BLI attenuation. A reading at or
+        below a detection limit raises ValueError (see ExtendedKalmanFilter).
+        """
+        self._check_known(params)
+        rate_set = self._build_rate_set(params)
+        series, mu0, anchor_modality, anchor_index, exposure_fn = self._filter_inputs(data, rate_set)
+        obs_params = {key: value for key, value in params.items() if key in OBSERVATION_PARAM_NAMES}
+        ekf = ExtendedKalmanFilter(MomentODE(rate_set, self.topology, exposure_fn), self.obs_model)
+        return ekf.filter(
+            series,
+            mu0,
+            params=obs_params,
+            anchor_modality=anchor_modality,
+            anchor_index=anchor_index,
+        )
+
+    def particle_filter(
+        self,
+        params: dict[str, float],
+        data: TimeSeriesData,
+        n_particles: int = 500,
+        rng: np.random.Generator | None = None,
+        max_total_events: int | None = None,
+    ) -> dict:
+        """Bootstrap particle filter for one series at these parameter values.
+
+        The counterpart of :meth:`kalman_filter` with the same rates, exposure,
+        initial state, anchor and observation models, but exact (Gillespie)
+        propagation and the observation models' own likelihoods, so it also
+        scores readings the Gaussian filter cannot: marker fractions and values
+        at a detection limit. Its log-likelihood is a Monte Carlo estimate.
+        Not represented: ``sigma_extrinsic``.
+
+        Returns:
+            The :meth:`ParticleFilter.filter` result plus ``times`` (from the
+            series' anchor on).
+        """
+        from umimic.inference.smc import ParticleFilter
+
+        self._check_known(params)
+        rate_set = self._build_rate_set(params)
+        series, mu0, anchor_modality, anchor_index, exposure_fn = self._filter_inputs(data, rate_set)
+        obs_params = {key: value for key, value in params.items() if key in OBSERVATION_PARAM_NAMES}
+        pf = ParticleFilter(
+            rate_set,
+            self.topology,
+            exposure_fn,
+            self.obs_model,
+            n_particles=n_particles,
+            rng=rng,
+            obs_params=obs_params,
+            max_total_events=max_total_events,
+        )
+        result = pf.filter(series, mu0, anchor_modality=anchor_modality, anchor_index=anchor_index)
+        result["times"] = series.times
+        return result
+
+    def _check_known(self, params: dict[str, float]) -> None:
+        unknown = sorted(set(params) - set(self.param_names))
+        if unknown:
+            raise ValueError(
+                f"Parameter(s) {unknown} are not in this likelihood's parameter "
+                f"set {self.param_names}."
+            )
+
+    def _filter_inputs(self, data: TimeSeriesData, rate_set: RateSet):
+        """The series from its anchor on, its initial state, anchor and exposure."""
+        exposure_fn = self.exposure_fn
+        if exposure_fn is None:
+            exposure_fn = ExposureProfile.constant(
+                data.concentration if data.concentration is not None else 0.0
+            )
+        mu0 = self._initial_state(data, rate_set)
+        keep = data.times >= self._initial_time(data)
+        series = replace(
+            data,
+            times=data.times[keep],
+            observations={name: values[keep] for name, values in data.observations.items()},
+            concentrations=None if data.concentrations is None else np.asarray(data.concentrations)[keep],
+        )
+        anchor_modality = anchor_index = None
+        if self.condition_on_first and series.has_modality(self.anchor_modality):
+            present = np.flatnonzero(series.observed_mask(self.anchor_modality))
+            if present.size:
+                anchor_modality, anchor_index = self.anchor_modality, int(present[0])
+        return series, mu0, anchor_modality, anchor_index, exposure_fn
 
     # ------------------------------------------------------------------
     # Likelihood evaluation
@@ -833,7 +1065,7 @@ class ModelLikelihood:
             # Var(H x) = H Sigma H^T, not the sum of all covariance entries.
             process_vars = None
             if covs is not None and isinstance(model, TopologyAwareObservation):
-                observable = MODALITY_OBSERVABLE.get(modality)
+                observable = self._observable_for_modality(modality)
                 if observable is not None:
                     process_vars = np.asarray(
                         model.project_variance(observable, covs[idx][mask])
@@ -848,6 +1080,11 @@ class ModelLikelihood:
 
         return total_ll
 
+    def _observable_for_modality(self, modality: str) -> str | None:
+        """State projection measured by this configured observation model."""
+        model = self._modality_models[modality]
+        return getattr(model, "count_type", MODALITY_OBSERVABLE.get(modality))
+
     def _fusable_modalities(self, data: TimeSeriesData) -> list[str]:
         """Active modalities on this replicate that can share one joint normal.
 
@@ -860,7 +1097,7 @@ class ModelLikelihood:
         for modality in self._active_modalities:
             if not data.has_modality(modality):
                 continue
-            if MODALITY_OBSERVABLE.get(modality) is None:
+            if self._observable_for_modality(modality) is None:
                 continue
             model = self._modality_models[modality]
             if type(model).linearize is ObservationModel.linearize:
@@ -937,7 +1174,7 @@ class ModelLikelihood:
 
             for m, value in present.items():
                 model = self._modality_models[m]
-                observable = MODALITY_OBSERVABLE[m]
+                observable = self._observable_for_modality(m)
                 pv = float(model.project_variance(observable, covs[idx[j]]))
                 ll = model.log_likelihood(value, state, point_params[m], pv)
                 if not np.isfinite(ll):
@@ -963,6 +1200,9 @@ class ModelLikelihood:
         obs_params = {
             k: v for k, v in params.items() if k in OBSERVATION_PARAM_NAMES
         }
+        custom_key = getattr(self._modality_models[modality], "overdispersion_key", None)
+        if custom_key in params:
+            obs_params[custom_key] = params[custom_key]
 
         if modality == "bli":
             for volume_key in ("volume", "tumor_volume"):
@@ -1014,26 +1254,8 @@ class ModelLikelihood:
         total_ll = 0.0
 
         for conc, series in self._conc_groups.items():
-            times = self._group_times[conc]
-            if len(times) < 2:
-                continue
-
-            # Replicates may start from different measured initial counts. When
-            # they do, each needs its own solve; otherwise one solve is shared.
-            initials = [self._initial_state(d, rate_set) for d in series]
-            shared = all(np.allclose(x, initials[0]) for x in initials)
-
             try:
-                if shared:
-                    t_sol, means, covs = self._solve_forward(
-                        rate_set, conc, times, initials[0]
-                    )
-                    solutions = [(t_sol, means, covs)] * len(series)
-                else:
-                    solutions = [
-                        self._solve_forward(rate_set, conc, times, x)
-                        for x in initials
-                    ]
+                solutions = self._forward_solutions(rate_set, conc, series)
             except (RuntimeError, ValueError) as exc:
                 logger.debug("Forward solve failed at conc=%s: %s", conc, exc)
                 return -np.inf

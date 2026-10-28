@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -26,12 +27,35 @@ class NumpyEncoder(json.JSONEncoder):
         return super().default(obj)
 
 
+def dataset_fingerprint(series) -> str:
+    """Identify the actual observations, exposure labels and series identities."""
+    records = [
+        {
+            "times": item.times,
+            "observations": item.observations,
+            "concentration": item.concentration,
+            "concentrations": item.concentrations,
+            "group_id": item.group_id,
+            "replicate_id": item.replicate_id,
+            "initial_condition": {
+                key: item.metadata[key]
+                for key in ("initial_cells", "initial_fractions")
+                if key in item.metadata
+            },
+        }
+        for item in series
+    ]
+    payload = json.dumps(records, sort_keys=True, cls=NumpyEncoder, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def save_result(result: InferenceResult, path: str | Path) -> None:
     """Save inference result to JSON file."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     data = {
+        "schema_version": 1,
         "method": result.method,
         "context": result.context,
         "point_estimates": result.point_estimates,
@@ -46,6 +70,8 @@ def save_result(result: InferenceResult, path: str | Path) -> None:
             "bic": result.mle.bic,
             "se": result.mle.se,
             "converged": result.mle.converged,
+            "hessian": result.mle.hessian,
+            "n_evaluations": result.mle.n_evaluations,
         }
 
     if result.mcmc is not None:
@@ -56,15 +82,18 @@ def save_result(result: InferenceResult, path: str | Path) -> None:
             "n_samples": result.mcmc.n_samples,
             "n_chains": result.mcmc.n_chains,
             "diagnostics": result.mcmc.diagnostics,
+            "samples": result.mcmc.samples,
+            "log_likelihood_trace": result.mcmc.log_likelihood_trace,
+            "log_posterior_trace": result.mcmc.log_posterior_trace,
         }
 
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, cls=NumpyEncoder)
 
 
 def load_result(path: str | Path) -> dict:
     """Load inference result from JSON file."""
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return json.load(f)
 
 

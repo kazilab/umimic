@@ -6,11 +6,12 @@ import logging
 from typing import Callable, Sequence
 
 import numpy as np
-from scipy.integrate import solve_ivp
 from scipy.linalg import expm
 
+from umimic.dynamics._integration import solve_ivp_exposure
 from umimic.dynamics.states import CellType, ModelTopology
 from umimic.dynamics.rates import RateSet
+from umimic.pk.exposure import ExposureProfile, is_constant_exposure
 from umimic.types import SimulationResult
 
 logger = logging.getLogger(__name__)
@@ -117,19 +118,30 @@ class CellDynamicsODE:
         high drug concentrations, actively harmful: RK45 fails over to BDF and
         a single fit can run for tens of minutes.
 
-        Linearity and time-invariance are *verified against the real RHS*
-        rather than assumed. ``rhs`` is linear with no constant term, so column
-        j is ``rhs`` applied to the j-th basis vector; the result is then
-        checked at interior and end times against a probe state. A
-        time-varying exposure (in vivo PK), a density-dependent topology or a
-        time-varying rate multiplier all fail that check and fall back to the
-        integrator.
+        Time invariance requires explicit exposure metadata, such as
+        ``ExposureProfile.constant(c)``. A few matching samples cannot prove
+        constancy: a complete treatment pulse may fall between them. Unknown
+        callables use numerical integration. ``rhs`` is linear with no
+        constant term, so column j is its value on the j-th basis vector.
         """
-        if self.topology.density_dependent or self.rate_multiplier_fn is not None:
+        if (
+            self.topology.density_dependent
+            or self.rate_multiplier_fn is not None
+            or not is_constant_exposure(self.exposure_fn)
+        ):
             return None
 
         n = len(self.topology.active_states)
         t0, t1 = float(t_span[0]), float(t_span[1])
+        direction = 1 if t1 >= t0 else -1
+        if (
+            t_eval.ndim != 1 or not len(t_eval)
+            or not np.all(np.isfinite(t_eval))
+            or np.any(direction * np.diff(t_eval) <= 0)
+            or np.any((t_eval < min(t0, t1)) | (t_eval > max(t0, t1)))
+        ):
+            # Let solve_ivp provide its normal input validation errors.
+            return None
 
         A = np.empty((n, n))
         for j in range(n):
@@ -139,15 +151,6 @@ class CellDynamicsODE:
         if not np.all(np.isfinite(A)):
             return None
 
-        # Distinct, strictly positive probe so a state-dependent or
-        # time-dependent term cannot cancel by coincidence.
-        probe = np.linspace(1.0, 2.0, n)
-        check_times = {t0, t1, 0.5 * (t0 + t1)}
-        if t_eval is not None and len(t_eval):
-            check_times.add(float(t_eval[len(t_eval) // 2]))
-        for t in check_times:
-            if not np.allclose(self.rhs(t, probe), A @ probe, rtol=1e-10, atol=1e-12):
-                return None
         return A
 
     def _solve_linear(
@@ -215,10 +218,11 @@ class CellDynamicsODE:
                               "nfev": len(y0) + 4},
                 )
 
-        sol = solve_ivp(
+        sol = solve_ivp_exposure(
             self.rhs,
             t_span,
             y0,
+            exposure_fn=self.exposure_fn,
             t_eval=t_eval,
             method=method,
             dense_output=True,
@@ -229,10 +233,11 @@ class CellDynamicsODE:
 
         if not sol.success:
             logger.warning("ODE solve with %s failed, retrying with BDF: %s", method, sol.message)
-            sol = solve_ivp(
+            sol = solve_ivp_exposure(
                 self.rhs,
                 t_span,
                 y0,
+                exposure_fn=self.exposure_fn,
                 t_eval=t_eval,
                 method="BDF",
                 dense_output=True,
@@ -276,14 +281,16 @@ class CellDynamicsODE:
             # Override exposure function with constant concentration
             original_fn = self.exposure_fn
             self.exposure_fn = self._make_constant_exposure_fn(conc)
-            results[conc] = self.solve(y0, t_span, t_eval)
-            self.exposure_fn = original_fn
+            try:
+                results[conc] = self.solve(y0, t_span, t_eval)
+            finally:
+                self.exposure_fn = original_fn
         return results
 
     @staticmethod
     def _make_constant_exposure_fn(c: float) -> Callable[[float], float]:
         """Build a constant-concentration exposure function."""
-        return lambda t: c
+        return ExposureProfile.constant(c)
 
 
 def build_ode_system(
@@ -301,8 +308,7 @@ def build_ode_system(
     if exposure_fn is None:
         fixed = constant_concentration if constant_concentration is not None else 0.0
 
-        def exposure_fn(t, _c=fixed):
-            return _c
+        exposure_fn = ExposureProfile.constant(fixed)
 
     return CellDynamicsODE(
         rate_set,

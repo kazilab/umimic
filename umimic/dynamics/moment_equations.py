@@ -14,8 +14,8 @@ import logging
 from typing import Callable
 
 import numpy as np
-from scipy.integrate import solve_ivp
 
+from umimic.dynamics._integration import solve_ivp_exposure
 from umimic.dynamics.states import CellType, ModelTopology
 from umimic.dynamics.rates import RateSet
 
@@ -341,10 +341,11 @@ class MomentODE:
 
         y0 = np.concatenate([mu0, Sigma0.flatten()])
 
-        sol = solve_ivp(
+        sol = solve_ivp_exposure(
             self.rhs,
             t_span,
             y0,
+            exposure_fn=self.exposure_fn,
             t_eval=t_eval,
             method=method,
             rtol=1e-6,
@@ -357,8 +358,9 @@ class MomentODE:
                 method,
                 sol.message,
             )
-            sol = solve_ivp(
+            sol = solve_ivp_exposure(
                 self.rhs, t_span, y0, t_eval=t_eval,
+                exposure_fn=self.exposure_fn,
                 method="BDF", rtol=1e-6, atol=1e-8,
             )
             if not sol.success:

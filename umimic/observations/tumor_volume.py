@@ -173,7 +173,8 @@ class TumorVolumeObservation(TopologyAwareObservation, ObservationModel):
         approximation beyond the usual EKF linearization is involved.
         """
         obs_val = float(observed)
-        if not np.isfinite(obs_val) or obs_val <= 0:
+        if (not np.isfinite(obs_val) or obs_val <= 0
+                or (self._lod(params) > 0 and obs_val <= self._lod(params))):
             return None
 
         x = np.asarray(latent_state, dtype=float)

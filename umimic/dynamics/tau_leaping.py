@@ -25,6 +25,7 @@ import numpy as np
 from umimic.dynamics.gillespie import GillespieSimulator, build_reactions
 from umimic.dynamics.rates import RateSet
 from umimic.dynamics.states import CellType, ModelTopology
+from umimic.pk.exposure import exposure_breakpoints, is_constant_exposure, shifted_exposure
 from umimic.types import EnsembleResult, SimulationResult
 
 logger = logging.getLogger(__name__)
@@ -176,6 +177,8 @@ class TauLeapingSimulator:
         if t_record is None:
             t_record = np.linspace(0, t_max, 100)
         t_record = np.asarray(t_record, dtype=float)
+        boundaries = exposure_breakpoints(self.exposure_fn, 0.0, t_max)
+        constant = is_constant_exposure(self.exposure_fn)
 
         # Small populations: the leap approximation is not valid, use exact SSA.
         if self._reactive_population(x0) < self.ssa_threshold:
@@ -203,6 +206,7 @@ class TauLeapingSimulator:
         tau_min = np.inf
 
         ssa_handoff_time: float | None = None
+        tail_metadata: dict = {}
 
         while t < t_max:
             # The leap approximation stops being valid when the population gets
@@ -221,8 +225,23 @@ class TauLeapingSimulator:
             propensities = np.maximum(propensities, 0.0)
             a0 = float(np.sum(propensities))
 
+            boundary_index = np.searchsorted(boundaries, t, side="right")
+            next_boundary = (
+                float(boundaries[boundary_index])
+                if boundary_index < len(boundaries) else t_max
+            )
+
             if a0 <= 0:
-                break
+                if not np.any(state > 0):
+                    break
+                # A dormant population may acquire nonzero rates after a
+                # delayed dose. Cross idle time without inventing a reaction.
+                t_next = t_max if constant else min(t + self.tau, next_boundary)
+                while rec_idx < len(t_record) and t_record[rec_idx] <= t_next:
+                    recorded[rec_idx] = state
+                    rec_idx += 1
+                t = t_next
+                continue
 
             crit = self._critical_mask(state, propensities)
             a_crit = float(np.sum(propensities[crit]))
@@ -230,7 +249,7 @@ class TauLeapingSimulator:
             # Candidate leap for the non-critical reactions: the error-control
             # step, capped by the user's nominal tau and the remaining time.
             tau_adaptive = self._leap_condition_tau(state, propensities, ~crit)
-            tau_leap = min(self.tau, tau_adaptive, t_max - t)
+            tau_leap = min(self.tau, tau_adaptive, next_boundary - t, t_max - t)
 
             # Time to the next critical (exactly simulated) reaction.
             if a_crit > 0:
@@ -345,7 +364,7 @@ class TauLeapingSimulator:
             ssa = GillespieSimulator(
                 self.rate_set,
                 self.topology,
-                lambda s, _t0=ssa_handoff_time: self.exposure_fn(_t0 + s),
+                shifted_exposure(self.exposure_fn, ssa_handoff_time),
                 self.rng,
             )
             tail = ssa.simulate(
@@ -356,6 +375,7 @@ class TauLeapingSimulator:
             for i, ct in enumerate(self.topology.active_states):
                 recorded[rec_idx:, i] = tail.populations[ct.name]
             rec_idx = len(t_record)
+            tail_metadata = tail.metadata
 
         # Remaining record slots (including t_max itself) take the final state.
         while rec_idx < len(t_record):
@@ -386,6 +406,13 @@ class TauLeapingSimulator:
                 "epsilon": self.epsilon,
                 "ssa_threshold": self.ssa_threshold,
                 "ssa_handoff_time": ssa_handoff_time,
+                # The SSA tail has an event limit; its tail is not a sample if hit.
+                "truncated": bool(tail_metadata.get("truncated", False)),
+                "t_reached": (
+                    ssa_handoff_time + tail_metadata["t_reached"]
+                    if tail_metadata.get("truncated")
+                    else None
+                ),
                 "n_leaps": n_leaps,
                 "n_rejected_leaps": n_rejected,
                 "n_critical_events": n_critical_fired,

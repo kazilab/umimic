@@ -126,9 +126,11 @@ Targets: `birth`, `death`, `transition`, or fine keys `death:P`,
 
 ### Integration
 
-1. Pathway ODE integrated on the cell simulation grid under \(C(t)\).
+1. Pathway ODE integrated over the full study from time zero under \(C(t)\),
+   with separate integration segments at known dose and infusion boundaries.
 2. Failed pathway solve → **RuntimeError** (no silent drop of coupling).
-3. Activity interpolated linearly in \(t\) for the multiplier callback.
+3. Activity evaluated from the pathway solver's dense output for the
+   multiplier callback, independently of the requested observation schedule.
 4. Cell ODE multiplies named rates by \(m(t,\mathrm{key})\).
 
 Supported for **ODE cell dynamics only**.

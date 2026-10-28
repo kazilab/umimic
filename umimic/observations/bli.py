@@ -257,7 +257,8 @@ class BLIObservation(TopologyAwareObservation, ObservationModel):
         in the state, so they cancel from ``d log(h)/dx = H_viable / N``.
         """
         obs_val = float(observed)
-        if not np.isfinite(obs_val) or obs_val <= 0:
+        if (not np.isfinite(obs_val) or obs_val <= 0
+                or (self._lod(params) > 0 and obs_val <= self._lod(params))):
             return None
 
         x = np.asarray(latent_state, dtype=float)
