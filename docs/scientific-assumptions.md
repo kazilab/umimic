@@ -2,7 +2,9 @@
 
 Each core package documents formulas, defaults, and common misuses in a
 `SCIENTIFIC_ASSUMPTIONS.md` file next to the source. This page indexes them
-and summarizes the rules that most often affect interpretation.
+and summarizes the rules that most often affect interpretation. For the
+equations from exposure to fitted parameters in one place, see
+[Mathematical model](mathematical-model.md).
 
 ## Package notes (source)
 
@@ -20,16 +22,16 @@ Full write-ups live next to the code (not duplicated here):
 
 ## Growth rates
 
-- **Asymptotic growth** \(g(C)\): dominant eigenvalue of the low-density
+- **Asymptotic growth** $g(C)$: dominant eigenvalue of the low-density
   multi-state rate matrix. Use for doubling time and long-run GR-style metrics
   (`RateSet.asymptotic_growth_rate`, `doubling_time`, `gr_value`).
-- **Naive net** \(b - d_P\): single-compartment diagnostic only
+- **Naive net** $b - d_P$: single-compartment diagnostic only
   (`net_growth_rate`). For the default P/Q model it overstates growth relative
-  to \(g(C)\).
+  to $g(C)$.
 - **Finite-horizon GR**: use `finite_horizon_gr` when a rare resistant state
   would dominate the asymptotic eigenvalue but not a short assay.
 
-Visualization dose–response plots default to **asymptotic** \(g(C)\).
+Visualization dose–response plots default to **asymptotic** $g(C)$.
 
 ## Inference contracts
 
@@ -45,10 +47,11 @@ Visualization dose–response plots default to **asymptotic** \(g(C)\).
 
 ## Observations
 
-- Counts: NegBin without process variance; Gaussian with
-  \(\mathrm{Var} = V_{\mathrm{proc}} + \mu + \mu^2/\phi\) in moment mode.
+- Counts: NegBin without process variance; in moment mode a NegBin whose size
+  is lowered so that $\mathrm{Var} = V_{\mathrm{proc}} + \mu + \mu^2/\phi$
+  (Gaussian only below the Poisson floor or on request).
 - BLI / volume: lognormal (scale = **median**); process variance via
-  \(\sigma_{\log}^2 + V/N^2\).
+  $\sigma_{\log}^2 + V/N^2$.
 - Free noise keys: `overdispersion`, `sigma_log_bli`, `sigma_v`,
   `biomarker_precision`.
 - Ki-67: fraction of **division_states** / viable (includes dividing R).
@@ -65,7 +68,7 @@ Visualization dose–response plots default to **asymptotic** \(g(C)\).
 ## Signaling coupling
 
 - Toy MAPK/AKT is a **scaffold**, not a cascade model.
-- Rate multiplier: \(\max(0,\,1 + m_{\max}\,e(a))\) — high pathway activity
+- Rate multiplier: $\max(0,\,1 + m_{\max}\,e(a))$ — high pathway activity
   **boosts** rates above the bare RateSet; pathway-off returns to 1.
 - Implemented for **deterministic ODE** cell dynamics only.
 

@@ -1,11 +1,15 @@
 # PyPI Trusted Publishing from GitHub Actions
 
-This project uses OpenID Connect (OIDC) trusted publishing to release to PyPI without storing PyPI API tokens in GitHub secrets.
+OpenID Connect (OIDC) trusted publishing can release to PyPI without storing
+PyPI API tokens in GitHub secrets. Publishing requires a configured GitHub
+workflow and a matching trusted publisher in the PyPI account. The workflow is
+in the repository (`.github/workflows/publish-pypi.yml`); the one-time PyPI and
+GitHub setup below still has to be done in those accounts.
 
-## What is configured in this repository
+## Required workflow configuration
 
 - Workflow file: `.github/workflows/publish-pypi.yml`
-- Trigger: Git tag pushes matching `v*` (for example `v0.0.2`)
+- Trigger: Git tag pushes matching `v*` (for example `v0.0.4`)
 - Build job: creates `sdist` + `wheel` and runs `twine check`
 - Publish job: uses `pypa/gh-action-pypi-publish` with `id-token: write`
 
@@ -15,7 +19,7 @@ This project uses OpenID Connect (OIDC) trusted publishing to release to PyPI wi
 2. In PyPI project settings, open `Publishing`.
 3. Add a `Trusted Publisher` with:
    - Owner: your GitHub org/user
-   - Repository: `python-release-readiness` (or the final repo name)
+   - Repository: `umimic` (or the actual repository name)
    - Workflow: `publish-pypi.yml`
    - Environment: `pypi`
 4. Save the trusted publisher.
@@ -32,9 +36,8 @@ No PyPI token secrets are required with trusted publishing.
 
 ## Release process
 
-1. Ensure package version is updated in:
-   - `pyproject.toml`
-   - `umimic/__init__.py`
+1. Update `__version__` in `umimic/__init__.py`. The build configuration reads
+   that value, so package metadata and `umimic --version` use the same version.
 2. Run release checks locally:
 
 ```bash
@@ -47,8 +50,8 @@ python -m twine check dist/*
 4. Create and push a version tag:
 
 ```bash
-git tag v0.0.2
-git push origin v0.0.2
+git tag v0.0.4
+git push origin v0.0.4
 ```
 
 5. Watch `Publish to PyPI` workflow in GitHub Actions.

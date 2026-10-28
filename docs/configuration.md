@@ -113,21 +113,49 @@ Unknown modality names are rejected at config validation.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `mode` | `str` | `"mle"` | `"mle"` or `"mcmc"` (orchestrator). SMC/hierarchical via `umimic.inference` directly |
-| `backend` | `str` | `"scipy"` | `"scipy"` (MLE), `"emcee"` (MCMC). PyMC withdrawn |
+| `mode` | `str` | `"mle"` | `"mle"`, `"mcmc"` (emcee, LNA likelihood), `"pmcmc"` (particle MCMC, exact stochastic likelihood) or `"hierarchical"` (emcee; `random_effects` vary by series) |
+| `backend` | `str` | `"scipy"` | `"scipy"` (MLE), `"emcee"` (MCMC), `"particle"` (only with `mode: pmcmc`). PyMC withdrawn |
 | `forward_mode` | `str` | `"moment"` | `"moment"` (LNA + process variance) or `"ode"` |
 | `parameter_set` | `str` | `"default"` | `"default"`, `"mechanism"`, `"resistance"`, `"persister"` |
-| `n_samples` | `int` | `2000` | MCMC draws per chain after warmup |
+| `n_samples` | `int` | `2000` | MCMC or particle MCMC draws per chain after warmup |
 | `n_chains` | `int` | `4` | Walkers / chains (emcee raises to ≥ 2·dim+2) |
 | `n_warmup` | `int` | `1000` | Burn-in |
 | `n_restarts` | `int` | `5` | MLE multi-start restarts |
-| `n_particles` | `int` | `500` | For direct ParticleMCMC use only |
+| `n_particles` | `int` | `500` | Particles per likelihood estimate (`mode: pmcmc`) |
+| `proposal_scale` | `float` | `0.05` | Particle MCMC random-walk step, on the log scale for strictly positive parameters |
+| `random_effects` | `list[str]` | `[]` | `mode: hierarchical`: parameters of the parameter set that vary by series; the rest are shared |
+
+`mode: pmcmc` runs particle MCMC on the same model as the other modes:
+sampled parameters over the configured rates, each series' exposure (PK
+included), initial state and observation models, and every series. Each
+iteration runs a particle filter per series with exact (Gillespie)
+simulation, so the cost grows with cell numbers; it suits small populations
+where the moment approximation is poor. The chain starts at the prior
+medians.
+
+`mode: hierarchical` treats each series as a group (a well, an animal). Each
+parameter in `random_effects` varies by series around a population median
+(`pop_mean_<name>`) with a between-series spread (`pop_sd_<name>`, log
+scale); the other parameters are shared. It uses the configured rates, PK
+exposure and observation models like the other modes, runs emcee with at
+least 2 x dimensions + 2 walkers, and takes the same checkpoint and progress
+arguments as MCMC.
 
 **Guards:**
 
 - `drug_mechanism` in `{cytostatic, mixed}` requires birth terms →
   `parameter_set=mechanism`.
 - `parameter_set=mechanism` requires `forward_mode=moment`.
+
+## `PriorConfig`
+
+Each entry is `{dist_param_scale: <median or scale>, dist_param_s: <log-scale
+SD>}`: with `dist_param_s` a lognormal, without it a half-normal. Five
+parameters have defaults (`b0`, `d0_P`, `emax_death`, `ec50_death`,
+`hill_death`); any other model parameter may be given a prior the same way,
+and an unknown name is rejected. Priors affect MCMC, particle MCMC,
+hierarchical fits and MAP; maximum likelihood with `backend: scipy` ignores
+them.
 
 ## `SignalingConfig`
 
@@ -169,14 +197,22 @@ Recommended ranges: `CouplingConfig.recommended_parameter_ranges()` or
 | `initial_cells` | `int` | `100` | Initial total count |
 | `t_max` | `float` | `72.0` | Duration (hours) |
 | `dt_obs` | `float` | `4.0` | Observation spacing (hours) |
+| `observation_times` | `list[float]` or `null` | `null` | Explicit, strictly increasing times within `[0, t_max]`; overrides `dt_obs` |
 | `n_replicates` | `int` | `4` | Wells / animals for synthetic data |
-| `seed` | `int` | `42` | Simulation seed (also top-level `seed`) |
+| `seed` | `int` or `null` | `null` | Simulation seed override; defaults to top-level `seed` |
+
+Simulation and synthetic generation share this schedule in both contexts.
+The regular grid always includes zero and `t_max`; the last interval may be
+shorter than `dt_obs`. For example, `t_max: 10` and `dt_obs: 4` produce
+`[0, 4, 8, 10]`.
 
 ## `PriorConfig`
 
-Legacy / documentation stubs for prior scales. Live fits use
-`PriorSpec.default_invitro()`, `default_mechanism()`, `default_resistance()`,
-or `default_persister()` according to `parameter_set`.
+Prior scales override the matching `PriorSpec.default_invitro()`,
+`default_mechanism()`, `default_resistance()`, or `default_persister()` factory.
+Use `dist_param_scale` for a half-normal prior, or additionally specify
+`dist_param_s` for a lognormal prior. Priors affect MCMC and MAP; pure scipy
+MLE uses the likelihood alone.
 
 ## Complete examples
 

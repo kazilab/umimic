@@ -18,4 +18,6 @@ exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
 # MyST markdown support
 myst_enable_extensions = [
     "colon_fence",
+    # $...$ and $$...$$ maths, the syntax GitHub also renders.
+    "dollarmath",
 ]

@@ -6,10 +6,9 @@
 pip install umimic
 ```
 
-From a source checkout (editable, recommended for development):
+From the source checkout root (editable, recommended for development):
 
 ```bash
-cd script/
 pip install -e .
 ```
 
@@ -159,6 +158,13 @@ umimic fit --config results/synthetic/config.yaml \
            --data results/synthetic/dataset.csv --output results/fit
 ```
 
+CSV input can contain `viable_count`, `bli`, `volume`, or `biomarker`
+observations; cell counts are optional when another modality is measured.
+Leave missing observations and unspecified concentrations blank. Exports
+preserve group and replicate identifiers, including replicate labels reused
+between treatment groups. CSV, `.csv.xz`, `.csv.gz`, and `.csv.bz2` files use
+the same format.
+
 ## In vivo PK sketch
 
 ```yaml
@@ -203,7 +209,7 @@ datasets = list_available_datasets()
 for name, info in datasets.items():
     print(f"{name}: {info['description']} (downloaded: {info['downloaded']})")
 
-data = load_bestdr(cell_line="MCF7", drug="paclitaxel")
+data = load_bestdr(cell_line="HCT116", drug="cisplatin")
 ```
 
 ## Signaling (scaffold only)

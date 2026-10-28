@@ -14,6 +14,14 @@ Developed by the Data Analysis Team @KaziLab.se.
 > earlier releases should be regenerated — see the project
 > [CHANGELOG](https://github.com/kazilab/umimic/blob/main/CHANGELOG.md).
 
+## Analysis workbench
+
+A guest-first website for configuring a plate, importing a table or a public
+dataset, simulating it, and running multi-start MLE lives in the `web/`
+directory. It calls this package and archives the same config, fingerprint,
+and result JSON as the CLI. These pages remain the documentation. See
+`web/README.md` to run the site.
+
 ## Getting started
 
 ```bash
@@ -27,6 +35,7 @@ umimic --help
 
 quickstart
 configuration
+mathematical-model
 scientific-assumptions
 ```
 
